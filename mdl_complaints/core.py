@@ -13,6 +13,7 @@ from typing import Any
 
 from .client import CourtListenerClient
 from .courts import expand_court_code
+from .titles import plaintiff_from_complaint_text, resolve_titles
 
 JPML_COURT_ID = "jpml"
 STORAGE_ROOT = "https://storage.courtlistener.com"
@@ -74,6 +75,8 @@ class Complaint:
     court_name: str
     case_number: str
     case_number_normalized: str
+    title: str
+    title_source: str
     page_count: int | None
     is_available: bool
     document_id: int
@@ -161,7 +164,7 @@ def fetch_entries(
     client: CourtListenerClient,
     docket_id: int,
     *,
-    max_pages: int = 1,
+    max_pages: int = 0,
     oldest_first: bool = True,
 ) -> tuple[list[dict[str, Any]], bool]:
     """Return ``(entries, truncated)``, oldest first by default.
@@ -171,8 +174,9 @@ def fetch_entries(
     newest-first, which on a mature docket means paging through hundreds of
     entries to reach the very thing we want.
 
-    ``truncated`` reports that more pages exist but were not fetched, so the
-    caller can tell "no more motions" apart from "stopped looking".
+    ``max_pages`` of 0 fetches every page.  ``truncated`` reports that more
+    pages exist but were not fetched, so the caller can tell "nothing more to
+    find" apart from "stopped looking".
     """
     params: dict[str, Any] = {"docket": docket_id}
     if oldest_first:
@@ -186,7 +190,7 @@ def fetch_entries(
         next_url = payload.get("next")
         if not next_url:
             return entries, False
-        if pages >= max_pages:
+        if max_pages and pages >= max_pages:
             return entries, True
         payload = client.get(next_url)
 
@@ -195,26 +199,31 @@ def collect_complaints(
     client: CourtListenerClient,
     mdl_number: str,
     *,
-    entry_prefix: str = DEFAULT_ENTRY_PREFIX,
-    max_pages: int = 1,
+    entry_prefix: str | None = None,
+    max_pages: int = 0,
     available_only: bool = False,
+    with_titles: bool = True,
+    pdf_fallback: bool = True,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[Complaint], bool]:
     """Return ``(docket, matching_entries, complaints, truncated)``.
 
-    Two requests in the normal case: one to resolve the docket, one for the
-    first page of entries.
+    ``entry_prefix`` of ``None`` scans every docket entry; pass
+    ``"MOTION TO TRANSFER"`` to narrow to the motions that created the MDL.
+    ``max_pages`` of 0 means "all pages".
     """
     docket = find_docket(client, mdl_number)
-    prefix = entry_prefix.strip().upper()
+    prefix = (entry_prefix or "").strip().upper()
 
     matching: list[dict[str, Any]] = []
     complaints: list[Complaint] = []
     seen: set[int] = set()
+    # The OCR text is already in the payload, so the PDF fallback is free.
+    texts: dict[int, str] = {}
 
     entries, truncated = fetch_entries(client, docket["id"], max_pages=max_pages)
     for entry in entries:
         description = (entry.get("description") or "").strip()
-        if not description.upper().startswith(prefix):
+        if prefix and not description.upper().startswith(prefix):
             continue
         matching.append(entry)
         for doc in entry.get("recap_documents") or []:
@@ -225,6 +234,7 @@ def collect_complaints(
             if doc["id"] in seen:
                 continue
             seen.add(doc["id"])
+            texts[doc["id"]] = doc.get("plain_text") or ""
             code, case_number = parse_complaint_description(doc.get("description") or "")
             absolute = doc.get("absolute_url") or ""
             complaints.append(
@@ -238,6 +248,8 @@ def collect_complaints(
                     court_name=expand_court_code(code),
                     case_number=case_number,
                     case_number_normalized=normalize_case_number(case_number),
+                    title="",
+                    title_source="",
                     page_count=doc.get("page_count"),
                     is_available=bool(doc.get("is_available")),
                     document_id=doc["id"],
@@ -248,5 +260,54 @@ def collect_complaints(
                 )
             )
 
+    if with_titles and complaints:
+        _attach_titles(client, complaints, texts, use_pdf_fallback=pdf_fallback)
+
     complaints.sort(key=lambda c: (c.entry_number or 0, c.attachment_number or 0))
     return docket, matching, complaints, truncated
+
+
+def collect_members(
+    client: CourtListenerClient,
+    mdl_number: str,
+    *,
+    max_pages: int = 0,
+) -> tuple[dict[str, Any], list[Any], bool]:
+    """Return ``(docket, member_cases, truncated)`` for an MDL number.
+
+    The member list is parsed from entry descriptions, so this costs the same
+    two-plus requests as the complaint scan and no more.
+    """
+    from .members import extract_members
+
+    docket = find_docket(client, mdl_number)
+    entries, truncated = fetch_entries(client, docket["id"], max_pages=max_pages)
+    return docket, extract_members(entries), truncated
+
+
+def _attach_titles(
+    client: CourtListenerClient,
+    complaints: list[Complaint],
+    texts: dict[int, str],
+    *,
+    use_pdf_fallback: bool = True,
+) -> None:
+    """Fill in ``title``/``title_source`` in place.
+
+    The member docket is authoritative.  Only where it has nothing do we fall
+    back to the complaint PDF, and the source is recorded either way so a
+    derived title is never mistaken for a looked-up one.
+    """
+    from .courts import courtlistener_id
+
+    titles = resolve_titles(client, complaints)
+    for complaint in complaints:
+        key = (courtlistener_id(complaint.court_code), complaint.case_number_normalized)
+        name = titles.get(key, "")
+        if name:
+            complaint.title, complaint.title_source = name, "docket"
+            continue
+        if use_pdf_fallback:
+            plaintiff = plaintiff_from_complaint_text(texts.get(complaint.document_id, ""))
+            if plaintiff:
+                complaint.title, complaint.title_source = plaintiff, "complaint-pdf"

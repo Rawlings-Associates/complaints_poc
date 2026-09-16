@@ -50,6 +50,98 @@ _REPORTER_RE = re.compile(r"^(?P<div>[NSEWCM])D(?P<state>[A-Z]{2})$")
 _DISTRICT_RE = re.compile(r"^D(?P<state>[A-Z]{2})$")
 
 
+# Districts whose CourtListener id does not follow the state+division+"d" rule.
+_TERRITORY_IDS = {
+    "DC": "dcd", "PR": "prd", "GU": "gud", "VI": "vid", "NMI": "nmid",
+}
+
+
+def parse_court_code(code: str) -> tuple[str, str]:
+    """Split a court code into ``(state_code, division_letter)``.
+
+    Returns ``("", "")`` when the code is not recognised.
+
+    >>> parse_court_code("CAN")
+    ('CA', 'N')
+    >>> parse_court_code("NDCA")
+    ('CA', 'N')
+    >>> parse_court_code("MA")
+    ('MA', '')
+    """
+    if not code:
+        return "", ""
+    key = code.strip().upper()
+    if key in STATES:
+        return key, ""
+    if len(key) == 3 and key[:2] in STATES and key[2] in DIVISIONS:
+        return key[:2], key[2]
+    match = _REPORTER_RE.match(key)
+    if match and match.group("state") in STATES:
+        return match.group("state"), match.group("div")
+    match = _DISTRICT_RE.match(key)
+    if match and match.group("state") in STATES:
+        return match.group("state"), ""
+    return "", ""
+
+
+def courtlistener_id(code: str) -> str:
+    """Map a JPML court code to a CourtListener ``court_id``.
+
+    CourtListener ids are the lowercased state code, the division letter and a
+    trailing ``d`` -- ``CAN`` and ``NDCA`` both become ``cand``.
+
+    >>> courtlistener_id("CAN")
+    'cand'
+    >>> courtlistener_id("NDCA")
+    'cand'
+    >>> courtlistener_id("NV")
+    'nvd'
+    >>> courtlistener_id("DC")
+    'dcd'
+    >>> courtlistener_id("ZZQ")
+    ''
+    """
+    key = (code or "").strip().upper()
+    if key in _TERRITORY_IDS:
+        return _TERRITORY_IDS[key]
+    state, division = parse_court_code(key)
+    if not state:
+        return ""
+    return f"{state}{division}d".lower()
+
+
+def _build_name_index() -> dict[str, str]:
+    """``{"california northern": "cand", ...}`` for parsing entry descriptions."""
+    index: dict[str, str] = {}
+    for state_code, state_name in STATES.items():
+        index[state_name.lower()] = f"{state_code.lower()}d"
+        for division_letter, division_name in DIVISIONS.items():
+            key = f"{state_name} {division_name}".lower()
+            index[key] = f"{state_code.lower()}{division_letter.lower()}d"
+    for code, name in TERRITORIES.items():
+        index[name.lower()] = _TERRITORY_IDS[code]
+    return index
+
+
+_NAME_TO_ID = _build_name_index()
+
+
+def court_id_from_name(name: str) -> str:
+    """Map a spelled-out district to a CourtListener ``court_id``.
+
+    JPML entry descriptions name courts in full ("Florida Northern District
+    Court"), unlike attachment descriptions which use codes.
+
+    >>> court_id_from_name("Florida Northern")
+    'flnd'
+    >>> court_id_from_name("District of Columbia")
+    'dcd'
+    >>> court_id_from_name("Atlantis Eastern")
+    ''
+    """
+    return _NAME_TO_ID.get((name or "").strip().lower(), "")
+
+
 def expand_court_code(code: str) -> str:
     """Return a human-readable district name for a JPML court code.
 
