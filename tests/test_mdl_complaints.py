@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import doctest
+import io
 import json
 import sys
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -497,6 +499,32 @@ class TestPlaintiffExtraction(unittest.TestCase):
         self.assertEqual(got.firms, "Seeger Weiss")
         self.assertEqual(got.docket_id, 4242)
         self.assertEqual(got.origin_state, "Minnesota")
+
+
+class TestVerboseOutputStaysOffStdout(unittest.TestCase):
+    """Diagnostics on stdout would corrupt --format csv / --format json."""
+
+    def test_cache_and_request_logging_goes_to_stderr(self):
+        from mdl_complaints.client import CourtListenerClient
+
+        client = CourtListenerClient(
+            token="x", cache_dir=Path(self.tmp), verbose=True,
+        )
+        url = "https://example.invalid/thing"
+        client._write_cache(url, {"results": []})
+
+        captured = io.StringIO()
+        with redirect_stdout(captured):
+            client.get(url)          # a cache hit, which logs when verbose
+        self.assertEqual(captured.getvalue(), "")
+
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = self._tmp.name
+
+    def tearDown(self):
+        self._tmp.cleanup()
 
 
 class TestCaseNumberNormalization(unittest.TestCase):

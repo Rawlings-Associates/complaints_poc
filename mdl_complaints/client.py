@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import ssl
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -79,7 +80,7 @@ class TokenBucket:
                     print(
                         f"  [rate-limit] {len(stamps)}/{self.max_calls} used; "
                         f"waiting {wait:.1f}s",
-                        flush=True,
+                        file=sys.stderr, flush=True,
                     )
                 time.sleep(wait)
             stamps = self._load()
@@ -156,7 +157,7 @@ class CourtListenerClient:
         if cached is not None:
             self.cache_hits += 1
             if self.verbose:
-                print(f"  [cache] {url}", flush=True)
+                print(f"  [cache] {url}", file=sys.stderr, flush=True)
             return cached
 
         payload = self._fetch(url)
@@ -175,7 +176,7 @@ class CourtListenerClient:
         for attempt in range(max_attempts):
             self.bucket.acquire(verbose=self.verbose)
             if self.verbose:
-                print(f"  [GET] {url}", flush=True)
+                print(f"  [GET] {url}", file=sys.stderr, flush=True)
             try:
                 with self._opener.open(request, timeout=self.timeout) as response:
                     self.request_count += 1
@@ -185,7 +186,10 @@ class CourtListenerClient:
                 if exc.code == 429:
                     wait = float(exc.headers.get("Retry-After") or 2 ** (attempt + 1))
                     if self.verbose:
-                        print(f"  [429] throttled; sleeping {wait:.0f}s", flush=True)
+                        print(
+                            f"  [429] throttled; sleeping {wait:.0f}s",
+                            file=sys.stderr, flush=True,
+                        )
                     time.sleep(min(wait, 120))
                     continue
                 if exc.code in (401, 403):
