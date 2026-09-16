@@ -21,8 +21,10 @@ from typing import Any, Iterable
 from .client import API_ROOT, CourtListenerClient
 from .courts import courtlistener_id
 
-#: Numbers per query. Kept modest so a court's results fit on one page.
-BATCH_SIZE = 15
+#: Numbers per query. The search endpoint ignores ``page_size`` and hard-caps
+#: results at 20 per page, so batching 20 fills exactly one page: fewer numbers
+#: wastes a request, more just spills onto a second page for no gain.
+BATCH_SIZE = 20
 MAX_PAGES_PER_BATCH = 3
 
 #: Complaint PDFs carry a signature block reading "Attorneys for Plaintiff

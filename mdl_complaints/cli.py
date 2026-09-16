@@ -19,6 +19,7 @@ from pathlib import Path
 
 from .client import DEFAULT_CACHE_DIR, CourtListenerClient, CourtListenerError
 from .members import resolve_member_titles
+from .titles import BATCH_SIZE
 from .core import (
     collect_members,
     DEFAULT_ENTRY_PREFIX,
@@ -230,7 +231,7 @@ def _run_members(args, client, canonical) -> int:
         print()
         print(_render_members(members) if members else "No member cases found.")
         if not args.resolve_names and members:
-            remaining = -(-sum(1 for m in members if not m.title) // 15)
+            remaining = -(-sum(1 for m in members if not m.title) // BATCH_SIZE)
             print(
                 f"\nTitles not looked up. --resolve-names would cost about "
                 f"{remaining} request(s); add --budget N to cap it.",

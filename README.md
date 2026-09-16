@@ -41,10 +41,11 @@ already fetched -- **no extra requests**:
 Cases are de-duplicated across entries, keeping the most authoritative mention
 (a case usually appears as a tag-along notice before the order that moved it).
 
-Captions are a separate, **budgeted** step: `--resolve-names` costs about one
-request per 15 cases (~437 for all of 3140, so ~45 min at 10/min). Every
-response is cached, so a run capped with `--budget N` simply continues where it
-left off next time.
+Captions are a separate, **budgeted** step. The search endpoint ignores
+`page_size` and hard-caps results at 20 per page, so queries batch exactly 20
+case numbers -- one filled page per request. That is ~295 requests for all of
+3140, about 30 minutes at 10/min. Every response is cached, so a run capped
+with `--budget N` simply continues where it left off next time.
 
 > Membership comes from the JPML docket, never from a name search. Searching
 > `flnd` for nearby case numbers returns unrelated matters (BP Exploration,
@@ -111,7 +112,7 @@ python3 -m mdl_complaints 3140 -v                         # log requests
 | --- | --- | --- |
 | `--format` | `table` | `table`, `json`, `csv` |
 | `--members` | off | list member cases instead of complaints |
-| `--resolve-names` | off | look up member captions (~1 request per 15) |
+| `--resolve-names` | off | look up member captions (~1 request per 20) |
 | `--budget N` | none | cap requests spent on names; resumable via cache |
 | `--court ID` | all | filter to one court, e.g. `flnd` |
 | `--limit N` | all | first N results only |
