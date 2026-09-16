@@ -126,6 +126,30 @@ def _build_name_index() -> dict[str, str]:
 _NAME_TO_ID = _build_name_index()
 
 
+def state_for_court_id(court_id: str) -> str:
+    """Return the state (or territory) a CourtListener district belongs to.
+
+    >>> state_for_court_id("cand")
+    'California'
+    >>> state_for_court_id("flnd")
+    'Florida'
+    >>> state_for_court_id("dcd")
+    'District of Columbia'
+    >>> state_for_court_id("nope")
+    ''
+    """
+    key = (court_id or "").strip().lower()
+    for code, court_id_for_state in _TERRITORY_IDS.items():
+        if key == court_id_for_state:
+            return TERRITORIES[code]
+    if not key.endswith("d") or len(key) < 3:
+        return ""
+    body = key[:-1]                      # drop the trailing "d"
+    if len(body) == 3 and body[2].upper() in DIVISIONS:
+        body = body[:2]
+    return STATES.get(body.upper(), "")
+
+
 def court_id_from_name(name: str) -> str:
     """Map a spelled-out district to a CourtListener ``court_id``.
 

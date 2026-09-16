@@ -20,7 +20,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Iterable
 
 from .client import API_ROOT, CourtListenerClient
-from .courts import court_id_from_name, courtlistener_id
+from .courts import court_id_from_name, courtlistener_id, state_for_court_id
 from .titles import BATCH_SIZE, MAX_PAGES_PER_BATCH, _build_query
 
 #: "Florida Northern District Court (3:26-cv-04417,3:26-cv-04418)"
@@ -64,13 +64,39 @@ class MemberCase:
     date_filed: str | None
     title: str = ""
     title_source: str = ""
+    plaintiff: str = ""
+    attorneys: str = ""
+    firms: str = ""
+    docket_id: int | None = None
+
+    @property
+    def origin_court(self) -> str:
+        """The district the case transferred *from*, if it transferred at all.
+
+        Cases filed directly in the transferee district did not come from
+        anywhere, so they have no originating court.
+        """
+        return "" if self.source == "cases-entered" else self.court_id
+
+    @property
+    def origin_state(self) -> str:
+        """State of the originating district -- blank for direct-filed cases.
+
+        This is a venue signal, not a residence: an MDL's transferee court
+        accepts direct filings from plaintiffs nationwide, so the transferee
+        district says nothing about where a direct-filing plaintiff lives.
+        """
+        return state_for_court_id(self.origin_court)
 
     @property
     def key(self) -> tuple[str, str]:
         return (self.court_id, self.case_number)
 
     def as_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        data = asdict(self)
+        data["origin_court"] = self.origin_court
+        data["origin_state"] = self.origin_state
+        return data
 
 
 def extract_members(entries: Iterable[dict[str, Any]]) -> list[MemberCase]:
@@ -147,9 +173,23 @@ def resolve_member_titles(
                     if result.get("court_id") != court_id:
                         continue
                     member = index.get((court_id, result.get("docketNumber") or ""))
+                    if member is None:
+                        continue
                     name = (result.get("caseName") or "").strip()
-                    if member is not None and name and not member.title:
+                    if name and not member.title:
                         member.title, member.title_source = name, "docket"
+                    # Parties ride along on the same response, so the plaintiff
+                    # and counsel cost nothing beyond the title lookup.
+                    if not member.plaintiff:
+                        member.plaintiff = "; ".join(
+                            plaintiffs_from_parties(result.get("party"))
+                        )
+                    if not member.attorneys:
+                        member.attorneys = "; ".join(result.get("attorney") or [])
+                    if not member.firms:
+                        member.firms = "; ".join(result.get("firm") or [])
+                    if member.docket_id is None:
+                        member.docket_id = result.get("docket_id")
                 pages += 1
                 next_url = payload.get("next")
                 if not next_url or pages >= MAX_PAGES_PER_BATCH:
@@ -159,3 +199,42 @@ def resolve_member_titles(
                 payload = client.get(next_url)
                 spent += 1
     return spent
+
+
+#: Parties common to every case in a products-liability MDL. Matched as whole
+#: words so a plaintiff surnamed e.g. "Cole" is not mistaken for a company.
+DEFENDANT_KEYWORDS = (
+    "PFIZER", "VIATRIS", "PHARMACIA", "UPJOHN", "GREENSTONE", "PRASCO",
+)
+#: Corporate suffixes; an individual plaintiff never carries one.
+_ORG_SUFFIX_RE = re.compile(
+    r"\b(INC|LLC|L\.L\.C|LP|LLP|CO|CORP|CORPORATION|COMPANY|LTD|PLC|N\.V|S\.A)\b\.?$",
+    re.IGNORECASE,
+)
+
+
+def is_defendant(party: str) -> bool:
+    """True when a party name looks like a corporate defendant.
+
+    >>> is_defendant("PFIZER INC")
+    True
+    >>> is_defendant("GREENSTONE LLC")
+    True
+    >>> is_defendant("ISABELLE CARRIGAN-BRODA")
+    False
+    """
+    name = (party or "").strip().upper()
+    if not name:
+        return True
+    if any(keyword in name for keyword in DEFENDANT_KEYWORDS):
+        return True
+    return bool(_ORG_SUFFIX_RE.search(name))
+
+
+def plaintiffs_from_parties(parties: Iterable[str]) -> list[str]:
+    """Keep only the parties that are not corporate defendants.
+
+    >>> plaintiffs_from_parties(["PFIZER INC", "DONNA TONEY", "PHARMACIA LLC"])
+    ['DONNA TONEY']
+    """
+    return [p.strip() for p in parties or [] if p and not is_defendant(p)]

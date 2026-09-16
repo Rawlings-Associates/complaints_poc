@@ -51,6 +51,37 @@ with `--budget N` simply continues where it left off next time.
 > `flnd` for nearby case numbers returns unrelated matters (BP Exploration,
 > USCIS), so only the docket text is authoritative.
 
+### Plaintiffs and counsel come free with the titles
+
+The `/parties/` endpoint returns **nothing** for these dockets -- they carry
+`source: 1` (a court scrape, not a purchased PACER docket report), so no party
+rows were ever created. The *search* index is populated regardless, and its
+results carry `party`, `attorney`, `firm` and `docket_id` alongside `caseName`.
+
+So `--resolve-names` fills in the plaintiff, counsel and firms at **no cost
+beyond the title lookup itself**. Corporate defendants (Pfizer, Viatris,
+Pharmacia, Upjohn, Greenstone, Prasco, and anything with a corporate suffix)
+are filtered out; on a 20-case sample the remaining party matched the case-name
+plaintiff **20 times out of 20**.
+
+### Origin state
+
+`origin_state` is derived from the district a case transferred *from*:
+`cacd` &rarr; California, `mnd` &rarr; Minnesota.
+
+It is deliberately **blank for direct-filed cases**, which is most of them:
+
+| | Cases | Origin state |
+| --- | ---: | --- |
+| Transferred in (order, motion, tag-along) | 165 | derived from the originating district |
+| Filed directly in the transferee district | 5,731 | *blank* |
+
+A transferee court takes direct filings from plaintiffs nationwide, so `flnd`
+would be a statement about where the MDL sits, not where the plaintiff lives --
+counsel on those cases includes firms from Michigan, New Jersey and New York.
+Calling all 5,731 "Florida" would be wrong, so the field stays empty and
+`--transferred-only` selects the subset where the signal is real.
+
 ## Complaints attached to the motions
 
 ```console
@@ -114,6 +145,7 @@ python3 -m mdl_complaints 3140 -v                         # log requests
 | `--members` | off | list member cases instead of complaints |
 | `--resolve-names` | off | look up member captions (~1 request per 20) |
 | `--budget N` | none | cap requests spent on names; resumable via cache |
+| `--transferred-only` | off | only cases with a real originating court |
 | `--court ID` | all | filter to one court, e.g. `flnd` |
 | `--limit N` | all | first N results only |
 | `--motions-only` | off | complaints: only motion-to-transfer entries |
@@ -188,6 +220,11 @@ table. Nothing is ever guessed -- unresolvable titles stay blank.
 
 - Member extraction depends on the JPML writing case numbers into entry text.
   Entries naming a court the tool cannot map are skipped rather than guessed at.
+- `origin_state` is a *venue* signal, not residence, and exists only for the 165
+  transferred-in cases. Nothing in the JPML docket records where a direct-filing
+  plaintiff lives.
+- Some search results give only a surname ("SANCHEZ"), others a full name
+  ("DONNA TONEY"); the tool reports whichever the index holds.
 - `--resolve-names` leaves a caption blank when CourtListener has no docket for
   that case; two of 3140's 28 complaint cases are absent from the index.
 - A complaint attached to a motion is found only if a party actually attached

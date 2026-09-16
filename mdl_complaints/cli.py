@@ -64,6 +64,13 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--transferred-only", action="store_true",
+        help=(
+            "only cases that transferred in from another district, i.e. the "
+            "ones with a meaningful originating court and state"
+        ),
+    )
+    parser.add_argument(
         "--court", metavar="ID",
         help="only cases from this CourtListener court id, e.g. flnd",
     )
@@ -158,9 +165,14 @@ def _clip(text: str, width: int) -> str:
 
 
 def _render_members(members: list, title_width: int = 52) -> str:
-    headers = ["#", "Court", "Case No.", "Title", "Source"]
+    headers = ["#", "Court", "Case No.", "Plaintiff", "Origin state", "Source"]
     rows = [
-        [str(i), m.court_id, m.case_number, _clip(m.title, title_width), m.source]
+        [
+            str(i), m.court_id, m.case_number,
+            _clip(m.plaintiff or m.title, title_width),
+            m.origin_state or "-",
+            m.source,
+        ]
         for i, m in enumerate(members, 1)
     ]
     widths = [
@@ -187,6 +199,8 @@ def _run_members(args, client, canonical) -> int:
     docket, members, truncated = collect_members(
         client, canonical, max_pages=args.max_pages
     )
+    if args.transferred_only:
+        members = [m for m in members if m.origin_court]
     if args.court:
         members = [m for m in members if m.court_id == args.court]
 
@@ -218,7 +232,8 @@ def _run_members(args, client, canonical) -> int:
         _write_rows_csv(
             members,
             ["court_id", "case_number", "source", "entry_number", "date_filed",
-             "title", "title_source"],
+             "origin_court", "origin_state", "title", "title_source",
+             "plaintiff", "attorneys", "firms", "docket_id"],
             sys.stdout,
         )
     else:

@@ -418,6 +418,87 @@ class TestMemberTitleResolution(unittest.TestCase):
         self.assertTrue(all(not m.title for m in self.members))
 
 
+class TestOriginState(unittest.TestCase):
+    """Origin state is a venue signal, and only for cases that transferred."""
+
+    def _member(self, court_id, source):
+        return members_mod.MemberCase(
+            court_id=court_id, case_number="1:25-cv-00001",
+            source=source, entry_number=1, date_filed="2025-01-01",
+        )
+
+    def test_transferred_case_reports_its_origin(self):
+        member = self._member("cacd", "conditional-transfer-order")
+        self.assertEqual(member.origin_court, "cacd")
+        self.assertEqual(member.origin_state, "California")
+
+    def test_direct_filed_case_has_no_origin(self):
+        # Filed straight into the transferee district: it came from nowhere,
+        # and flnd must not be read as "this plaintiff is Floridian".
+        member = self._member("flnd", "cases-entered")
+        self.assertEqual(member.origin_court, "")
+        self.assertEqual(member.origin_state, "")
+
+    def test_state_lookup_covers_divisions_and_territories(self):
+        self.assertEqual(courts.state_for_court_id("cand"), "California")
+        self.assertEqual(courts.state_for_court_id("nvd"), "Nevada")
+        self.assertEqual(courts.state_for_court_id("dcd"), "District of Columbia")
+        self.assertEqual(courts.state_for_court_id("prd"), "Puerto Rico")
+        self.assertEqual(courts.state_for_court_id("bogus"), "")
+
+    def test_origin_fields_are_exported(self):
+        data = self._member("mnd", "tag-along").as_dict()
+        self.assertEqual(data["origin_court"], "mnd")
+        self.assertEqual(data["origin_state"], "Minnesota")
+
+
+class TestPlaintiffExtraction(unittest.TestCase):
+    def test_drops_known_pharma_defendants(self):
+        self.assertEqual(
+            members_mod.plaintiffs_from_parties([
+                "PFIZER INC", "VIATRIS INC", "PHARMACIA & UPJOHN",
+                "GREENSTONE LLC", "ISABELLE CARRIGAN-BRODA", "PRASCO LABS",
+            ]),
+            ["ISABELLE CARRIGAN-BRODA"],
+        )
+
+    def test_drops_anything_with_a_corporate_suffix(self):
+        self.assertTrue(members_mod.is_defendant("SOME HOLDINGS LLC"))
+        self.assertTrue(members_mod.is_defendant("ACME CORP"))
+        self.assertFalse(members_mod.is_defendant("DONNA TONEY"))
+
+    def test_keeps_surname_only_plaintiffs(self):
+        self.assertEqual(
+            members_mod.plaintiffs_from_parties(["SANCHEZ", "PFIZER INC"]),
+            ["SANCHEZ"],
+        )
+
+    def test_handles_empty_and_missing_party_lists(self):
+        self.assertEqual(members_mod.plaintiffs_from_parties([]), [])
+        self.assertEqual(members_mod.plaintiffs_from_parties(None), [])
+
+    def test_parties_are_captured_during_title_resolution(self):
+        member_list = members_mod.extract_members([{
+            "entry_number": 1, "date_filed": "2025-01-01",
+            "description": "NOTICE OF POTENTIAL TAG-ALONG -- "
+                           "Minnesota District Court (0:26-cv-00123)",
+        }])
+        client = FakeClient()
+        client.search_results = [{
+            "court_id": "mnd", "docketNumber": "0:26-cv-00123",
+            "caseName": "TONEY v. PFIZER INC", "docket_id": 4242,
+            "party": ["DONNA TONEY", "PFIZER INC"],
+            "attorney": ["CHRISTOPHER A SEEGER"], "firm": ["Seeger Weiss"],
+        }]
+        members_mod.resolve_member_titles(client, member_list)
+        got = member_list[0]
+        self.assertEqual(got.plaintiff, "DONNA TONEY")
+        self.assertEqual(got.attorneys, "CHRISTOPHER A SEEGER")
+        self.assertEqual(got.firms, "Seeger Weiss")
+        self.assertEqual(got.docket_id, 4242)
+        self.assertEqual(got.origin_state, "Minnesota")
+
+
 class TestCaseNumberNormalization(unittest.TestCase):
     def test_jpml_shorthand_matches_full_form(self):
         self.assertEqual(
