@@ -75,6 +75,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="only cases from this CourtListener court id, e.g. flnd",
     )
     parser.add_argument(
+        "--out", metavar="PATH",
+        help=(
+            "write results to PATH instead of stdout, refreshed after every "
+            "batch so an interrupted run keeps what it already resolved"
+        ),
+    )
+    parser.add_argument(
         "--limit", type=int, default=None, metavar="N",
         help="only the first N results",
     )
@@ -204,10 +211,31 @@ def _run_members(args, client, canonical) -> int:
     if args.court:
         members = [m for m in members if m.court_id == args.court]
 
+    fields = [
+        "court_id", "case_number", "source", "entry_number", "date_filed",
+        "origin_court", "origin_state", "title", "title_source",
+        "plaintiff", "attorneys", "firms", "docket_id",
+    ]
+
+    def checkpoint(spent_so_far: int) -> None:
+        """Rewrite the output file mid-run so progress survives a kill."""
+        if not args.out:
+            return
+        with open(args.out, "w", newline="") as handle:
+            _write_rows_csv(members, fields, handle)
+        done = sum(1 for m in members if m.title)
+        print(
+            f"  [checkpoint] {done}/{len(members)} resolved, "
+            f"{spent_so_far} request(s) -> {args.out}",
+            file=sys.stderr, flush=True,
+        )
+
     spent = 0
     if args.resolve_names:
         target = members[: args.limit] if args.limit else members
-        spent = resolve_member_titles(client, target, max_requests=args.budget)
+        spent = resolve_member_titles(
+            client, target, max_requests=args.budget, on_progress=checkpoint,
+        )
 
     if args.limit:
         members = members[: args.limit]
@@ -229,13 +257,12 @@ def _run_members(args, client, canonical) -> int:
         )
         sys.stdout.write("\n")
     elif args.format == "csv":
-        _write_rows_csv(
-            members,
-            ["court_id", "case_number", "source", "entry_number", "date_filed",
-             "origin_court", "origin_state", "title", "title_source",
-             "plaintiff", "attorneys", "firms", "docket_id"],
-            sys.stdout,
-        )
+        if args.out:
+            with open(args.out, "w", newline="") as handle:
+                _write_rows_csv(members, fields, handle)
+            print(f"wrote {len(members)} rows to {args.out}", file=sys.stderr)
+        else:
+            _write_rows_csv(members, fields, sys.stdout)
     else:
         print(f"{docket.get('docket_number')} - {docket.get('case_name')}")
         by_court = Counter(m.court_id for m in members)

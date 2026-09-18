@@ -41,6 +41,11 @@ already fetched -- **no extra requests**:
 Cases are de-duplicated across entries, keeping the most authoritative mention
 (a case usually appears as a tag-along notice before the order that moved it).
 
+Long runs should use `--out PATH`: the file is rewritten after every batch, so
+a run that is killed keeps everything it has resolved. Without it the CSV is
+written only at the end and an interrupted job shows nothing -- though the
+response cache still means the next run does not re-fetch.
+
 Captions are a separate, **budgeted** step. The search endpoint ignores
 `page_size` and hard-caps results at 20 per page, so queries batch exactly 20
 case numbers -- one filled page per request. That is ~295 requests for all of
@@ -146,6 +151,7 @@ python3 -m mdl_complaints 3140 -v                         # log requests
 | `--resolve-names` | off | look up member captions (~1 request per 20) |
 | `--budget N` | none | cap requests spent on names; resumable via cache |
 | `--transferred-only` | off | only cases with a real originating court |
+| `--out PATH` | stdout | write to PATH, refreshed after every batch |
 | `--court ID` | all | filter to one court, e.g. `flnd` |
 | `--limit N` | all | first N results only |
 | `--motions-only` | off | complaints: only motion-to-transfer entries |
@@ -227,6 +233,12 @@ table. Nothing is ever guessed -- unresolvable titles stay blank.
   ("DONNA TONEY"); the tool reports whichever the index holds.
 - `--resolve-names` leaves a caption blank when CourtListener has no docket for
   that case; two of 3140's 28 complaint cases are absent from the index.
+- **Member-case complaint PDFs are not downloadable.** The member dockets list a
+  "Complaint" entry, but it is `is_available: false` with no stored file --
+  nobody bought it from PACER, so RECAP has no copy. Across a six-docket sample,
+  zero were fetchable. Only the complaints *attached to the motions to transfer*
+  have PDFs (28 of 28 for MDL 3140), because the moving party filed them as
+  exhibits on the JPML docket itself.
 - A complaint attached to a motion is found only if a party actually attached
   it. For 3140, all 438 entries yielded 28 complaint attachments, every one on a
   motion to transfer -- so `--motions-only` returns the same 28 for two requests

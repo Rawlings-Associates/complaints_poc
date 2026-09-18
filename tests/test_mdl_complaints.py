@@ -527,6 +527,43 @@ class TestVerboseOutputStaysOffStdout(unittest.TestCase):
         self._tmp.cleanup()
 
 
+class TestResolutionCheckpointing(unittest.TestCase):
+    """A long run must not lose resolved rows if it is killed mid-flight."""
+
+    def _many_members(self, count):
+        numbers = ",".join(f"3:25-cv-{n:05d}" for n in range(1, count + 1))
+        return members_mod.extract_members([{
+            "entry_number": 1, "date_filed": "2025-01-01",
+            "description": "XYZ CASES ENTERED -- Florida Northern District "
+                           f"Court ({numbers})",
+        }])
+
+    def test_progress_callback_fires_once_per_batch(self):
+        member_list = self._many_members(45)          # 3 batches of 20
+        client = FakeClient()
+        seen = []
+        members_mod.resolve_member_titles(
+            client, member_list, on_progress=seen.append
+        )
+        self.assertEqual(len(seen), 3)
+        self.assertEqual(seen, sorted(seen))          # spend only grows
+
+    def test_callback_is_optional(self):
+        member_list = self._many_members(25)
+        # No on_progress: must still resolve without raising.
+        spent = members_mod.resolve_member_titles(FakeClient(), member_list)
+        self.assertEqual(spent, 2)
+
+    def test_budget_still_caps_when_checkpointing(self):
+        member_list = self._many_members(100)
+        seen = []
+        spent = members_mod.resolve_member_titles(
+            FakeClient(), member_list, max_requests=2, on_progress=seen.append
+        )
+        self.assertEqual(spent, 2)
+        self.assertLessEqual(len(seen), 2)
+
+
 class TestCaseNumberNormalization(unittest.TestCase):
     def test_jpml_shorthand_matches_full_form(self):
         self.assertEqual(

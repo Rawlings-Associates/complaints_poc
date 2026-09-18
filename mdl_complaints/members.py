@@ -141,12 +141,17 @@ def resolve_member_titles(
     *,
     max_requests: int | None = None,
     batch_size: int = BATCH_SIZE,
+    on_progress: Any = None,
 ) -> int:
     """Fill in ``title`` on member cases in place. Returns requests spent.
 
     Queries are grouped by court and OR-batched, exactly as for complaints.
     ``max_requests`` caps the spend; because every response is cached, a capped
     run can simply be repeated to make further progress.
+
+    ``on_progress`` is called after each batch so a long run can checkpoint its
+    output. Without it a job that is interrupted late loses everything it has
+    resolved, even though the responses themselves are cached.
     """
     by_court: dict[str, list[MemberCase]] = {}
     for member in members:
@@ -167,6 +172,7 @@ def resolve_member_titles(
                 {"type": "d", "court": court_id, "q": _build_query(batch)},
             )
             spent += 1
+            checkpoint = True
             pages = 0
             while True:
                 for result in payload.get("results") or []:
@@ -198,6 +204,8 @@ def resolve_member_titles(
                     return spent
                 payload = client.get(next_url)
                 spent += 1
+            if checkpoint and on_progress is not None:
+                on_progress(spent)
     return spent
 
 
