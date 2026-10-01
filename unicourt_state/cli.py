@@ -100,10 +100,6 @@ def _client(args) -> UniCourtClient:
     env = _env_credentials()
     entry = store.find(root, workspace, env[0] if env else None)
     if entry is None:
-        if not workspace:
-            raise SystemExit("No stored token yet. Set UNICOURT_WORKSPACE (or --workspace) and "
-                             "UNICOURT_CLIENT_ID / UNICOURT_CLIENT_SECRET; a workspace token is "
-                             "created once and stored for later runs.")
         entry = _create_token(store, root, workspace, _ask_credentials(), args.verbose)
 
     def replace_rejected_token():
@@ -120,7 +116,16 @@ def _client(args) -> UniCourtClient:
 
 
 def _create_token(store, root, workspace, credentials, verbose=False) -> dict[str, Any]:
+    """Create and store a workspace token; without a workspace id, look it up first."""
     client_id, secret = credentials
+    if not workspace:
+        _err("No workspace given: looking up the account's DEEP workspace...")
+        found = creds.discover_workspace(
+            lambda token: UniCourtClient(token, "", root=root, verbose=verbose),
+            client_id, secret, note=_err)
+        workspace = found["workspaceId"]
+        _err(f"Using workspace {workspace} ({found.get('workspaceType', '?')}: "
+             f"{found.get('workspaceName', '')}).")
     api = UniCourtClient("", workspace, root=root, verbose=verbose)
     entry = creds.generate(api, client_id, secret, workspace)
     store.save(entry)
@@ -154,7 +159,8 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser("token", help="create, show, refresh or revoke the stored workspace token")
-    p.add_argument("--workspace", help="workspace id (default: $UNICOURT_WORKSPACE, or the stored one)")
+    p.add_argument("--workspace", help="workspace id (default: $UNICOURT_WORKSPACE, the stored one, "
+                   "or the account's DEEP workspace, looked up)")
     action = p.add_mutually_exclusive_group()
     action.add_argument("--refresh", action="store_true",
                         help="create a new token, then revoke the old one with UniCourt")
@@ -329,8 +335,6 @@ def cmd_token(args) -> int:
             return 0
         entry = entry_new
     elif entry is None:
-        if not workspace:
-            raise SystemExit("Set UNICOURT_WORKSPACE (or --workspace) to create a workspace token.")
         entry = _create_token(store, root, workspace, _ask_credentials(), args.verbose)
 
     print(f"Stored token:  {mask(entry['access_token'])} (token id {entry['token_id']})")

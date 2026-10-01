@@ -215,7 +215,7 @@ plaintiffs named in them to CSV.
 
 ```console
 $ pip install -e .                                   # installs the `unicourt` command and pypdf
-$ export UNICOURT_CLIENT_ID=... UNICOURT_CLIENT_SECRET=... UNICOURT_WORKSPACE=...
+$ export UNICOURT_CLIENT_ID=... UNICOURT_CLIENT_SECRET=...
 $ unicourt token                                     # optional: create the token now
 ```
 
@@ -223,6 +223,13 @@ You never handle the access token yourself.
 
 1. **First run:** the first command that needs the API exchanges your client
    ID and secret for a **workspace token** (`POST /generateNewWorkspaceToken`).
+   If you didn't name a workspace, it looks one up first:
+   1. It creates a temporary account token.
+   2. It takes the account's **DEEP** workspace, from the token response or
+      else from `GET /workspaces`. If there is only one workspace in total,
+      it uses that one. If the choice is ambiguous, it stops and lists them.
+   3. It revokes the temporary account token straight away, even if a step
+      failed, so it doesn't use up one of the account's 10 token slots.
 2. **Storage:** it saves the token to `~/.config/unicourt/credentials.json`.
    The file is readable only by you (permissions 600, in a 700 directory) and
    is written atomically. It holds the token, its ID, the workspace ID, the
@@ -238,7 +245,7 @@ You never handle the access token yourself.
 | Variable | Needed | Purpose |
 | --- | --- | --- |
 | `UNICOURT_CLIENT_ID`, `UNICOURT_CLIENT_SECRET` | To create the token, then only to replace or revoke it | If unset in a terminal, you are asked (the secret is hidden) |
-| `UNICOURT_WORKSPACE` | First run only; it is stored with the token | Or pass `--workspace` |
+| `UNICOURT_WORKSPACE` | Never: the DEEP workspace is looked up | Only to choose a different workspace (or `--workspace`); stored with the token |
 | `UNICOURT_TOKEN` | Never | Uses this token instead of the stored one (needs a workspace) |
 | `UNICOURT_CREDENTIALS_FILE` | Never | Stores the token somewhere else |
 | `UNICOURT_API_ROOT` | Never | Base URL (default `https://deep-api.unicourt.com`) |

@@ -135,6 +135,60 @@ class TokenStore:
 
 # -- talking to UniCourt ------------------------------------------------------------
 
+def discover_workspace(make_api, client_id: str, client_secret: str, note=None) -> dict[str, Any]:
+    """Find the workspace to use, so nobody has to look its id up.
+
+    A temporary *account* token is created (``POST /generateNewToken``). Its
+    response carries the account's DEEP workspace (``deepWorkspace``); if not,
+    ``GET /workspaces`` is listed and the workspace of type ``DEEP`` is taken
+    (or the only workspace, if there is just one). The account token is always
+    revoked afterwards (``PUT /invalidateToken``) so it does not count against
+    the account's 10-token limit.
+
+    ``make_api(token)`` returns a ``UniCourtClient`` using that token.
+    """
+    note = note or (lambda _msg: None)
+    api = make_api("")
+    try:
+        account = api.request("POST", "/generateNewToken", auth=False,
+                              body={"clientId": client_id, "clientSecret": client_secret})
+    except UniCourtError as exc:
+        if exc.code == "UN203":
+            raise SystemExit("The account already has the maximum of 10 account tokens, so the "
+                             "workspace cannot be looked up. Revoke unused ones (UniCourt's "
+                             "/listAllTokenIds and /invalidateToken) or set UNICOURT_WORKSPACE.") from None
+        raise
+    token_id = account.get("tokenId", "")
+    try:
+        workspace = account.get("deepWorkspace") or {}
+        if workspace.get("workspaceId"):
+            return workspace
+        listing = make_api(account["accessToken"])
+        workspaces = list(listing.paginate("/workspaces", "workspaceArray"))
+        return _choose_workspace(workspaces)
+    finally:
+        try:
+            api.request("PUT", "/invalidateToken", auth=False,
+                        body={"clientId": client_id, "clientSecret": client_secret, "tokenId": token_id})
+        except UniCourtError as exc:
+            note(f"Could not revoke the temporary account token {token_id}: {exc}. "
+                 "Revoke it in UniCourt to free the slot.")
+
+
+def _choose_workspace(workspaces: list[dict[str, Any]]) -> dict[str, Any]:
+    deep = [w for w in workspaces if str(w.get("workspaceType", "")).upper() == "DEEP"]
+    if len(deep) == 1:
+        return deep[0]
+    if not deep and len(workspaces) == 1:
+        return workspaces[0]
+    if not workspaces:
+        raise SystemExit("The account has no workspaces. Create one in UniCourt first.")
+    listed = "\n".join(f"  {w.get('workspaceId')}  {w.get('workspaceType', '?'):<7} {w.get('workspaceName', '')}"
+                       for w in workspaces)
+    raise SystemExit("Could not pick a workspace automatically "
+                     f"({len(deep)} of type DEEP). Choose one with UNICOURT_WORKSPACE or --workspace:\n{listed}")
+
+
 def generate(api: UniCourtClient, client_id: str, client_secret: str, workspace_id: str) -> dict[str, Any]:
     """Create a workspace token and return the entry to store."""
     try:

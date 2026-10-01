@@ -987,10 +987,25 @@ class CredentialsTests(unittest.TestCase):
         self.assertEqual((api.token, api.workspace_id), ("explicit", "wk9"))
         self.assertFalse(self.path.exists())
 
-    def test_no_token_and_no_workspace_explains_what_to_set(self):
-        with self.assertRaises(SystemExit) as ctx:
+    def test_no_credentials_and_no_terminal_explains_what_to_set(self):
+        with mock.patch.object(cli, "_ask_terminal", return_value=None), \
+                mock.patch.object(cli.getpass, "getpass", side_effect=EOFError), \
+                self.assertRaises(SystemExit) as ctx:
             cli._client(self._args())
         self.assertIn("UNICOURT_CLIENT_ID", str(ctx.exception))
+
+    def test_workspace_is_looked_up_when_not_given(self):
+        os.environ.update(UNICOURT_CLIENT_ID="client-1", UNICOURT_CLIENT_SECRET="s3cret")
+        found = {"workspaceId": "deep01", "workspaceType": "DEEP", "workspaceName": "DEEP"}
+        with mock.patch.object(credentials_mod, "discover_workspace", return_value=found) as discover, \
+                mock.patch.object(credentials_mod, "generate",
+                                  side_effect=lambda api, c, sec, ws: self._entry(ws, client=c)) as generate, \
+                redirect_stderr(io.StringIO()) as err:
+            api = cli._client(self._args())
+        self.assertEqual(api.workspace_id, "deep01")
+        self.assertEqual(generate.call_args[0][3], "deep01")
+        self.assertEqual(discover.call_count, 1)
+        self.assertIn("Using workspace deep01 (DEEP: DEEP)", err.getvalue())
 
     def test_rejected_token_is_replaced_once_and_stored(self):
         credentials_mod.TokenStore().save(self._entry(token="old-token-" + "x" * 20))
@@ -1052,6 +1067,65 @@ class CredentialsTests(unittest.TestCase):
         with self.assertRaises(SystemExit) as ctx:
             credentials_mod.generate(Api(), "c", "s", "wk1")
         self.assertIn("maximum of 10 tokens", str(ctx.exception))
+
+    class _DiscoveryApi:
+        """Fake UniCourt for discover_workspace: records calls, serves canned answers."""
+
+        def __init__(self, calls, token_response, workspaces=(), fail_list=False):
+            self.calls, self.token_response = calls, token_response
+            self.workspaces, self.fail_list = list(workspaces), fail_list
+
+        def request(self, method, path, auth=True, body=None, **kw):
+            self.calls.append((method, path, body))
+            return self.token_response if path == "/generateNewToken" else {"object": "Success"}
+
+        def paginate(self, path, array_key, params=None, **kw):
+            self.calls.append(("GET", path, None))
+            if self.fail_list:
+                raise client_mod.UniCourtError(500, "UN500")
+            return iter(self.workspaces)
+
+    def _discover(self, token_response, workspaces=(), fail_list=False):
+        calls = []
+        make_api = lambda token: self._DiscoveryApi(calls, token_response, workspaces, fail_list)  # noqa: E731
+        try:
+            return credentials_mod.discover_workspace(make_api, "client-1", "s3cret"), calls
+        except BaseException as exc:
+            exc.calls = calls
+            raise
+
+    def test_discover_uses_deep_workspace_from_the_token_response(self):
+        deep = {"workspaceId": "7zlq3xbp", "workspaceType": "DEEP", "workspaceName": "DEEP"}
+        found, calls = self._discover({"accessToken": "acct", "tokenId": "T1", "deepWorkspace": deep})
+        self.assertEqual(found["workspaceId"], "7zlq3xbp")
+        self.assertEqual([c[1] for c in calls], ["/generateNewToken", "/invalidateToken"])  # no listing needed
+        self.assertEqual(calls[-1][2], {"clientId": "client-1", "clientSecret": "s3cret", "tokenId": "T1"})
+
+    def test_discover_lists_workspaces_and_prefers_deep(self):
+        workspaces = [{"workspaceId": "u1", "workspaceType": "USER"},
+                      {"workspaceId": "d1", "workspaceType": "DEEP"},
+                      {"workspaceId": "s1", "workspaceType": "SHARED"}]
+        found, calls = self._discover({"accessToken": "acct", "tokenId": "T1"}, workspaces)
+        self.assertEqual(found["workspaceId"], "d1")
+        self.assertEqual([c[1] for c in calls], ["/generateNewToken", "/workspaces", "/invalidateToken"])
+
+    def test_discover_single_workspace_without_deep(self):
+        found, _ = self._discover({"accessToken": "a", "tokenId": "T1"}, [{"workspaceId": "only", "workspaceType": "SHARED"}])
+        self.assertEqual(found["workspaceId"], "only")
+
+    def test_discover_ambiguous_lists_choices_and_still_revokes(self):
+        workspaces = [{"workspaceId": "s1", "workspaceType": "SHARED", "workspaceName": "Team A"},
+                      {"workspaceId": "s2", "workspaceType": "SHARED", "workspaceName": "Team B"}]
+        with self.assertRaises(SystemExit) as ctx:
+            self._discover({"accessToken": "a", "tokenId": "T1"}, workspaces)
+        self.assertIn("s1", str(ctx.exception.code))
+        self.assertIn("Team B", str(ctx.exception.code))
+        self.assertEqual(ctx.exception.calls[-1][1], "/invalidateToken")
+
+    def test_discover_revokes_the_account_token_even_when_listing_fails(self):
+        with self.assertRaises(client_mod.UniCourtError) as ctx:
+            self._discover({"accessToken": "a", "tokenId": "T1"}, fail_list=True)
+        self.assertEqual(ctx.exception.calls[-1][1], "/invalidateToken")
 
     def test_revoke_and_refresh(self):
         store = credentials_mod.TokenStore()
