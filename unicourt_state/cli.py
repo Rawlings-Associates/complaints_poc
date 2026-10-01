@@ -1,18 +1,22 @@
-"""Command line: find state-court cases by party, then fetch their filings.
+"""Command line: find state- or federal-court cases by party, then fetch their filings.
 
 Workflow::
 
-    unicourt search --court-id CORT... --party "Acme" --limit 0 --out cases.csv
+    unicourt search --state "New York" --court-type state --party "Acme" --party "Beta" \
+        --limit 0 --out cases.csv          # several parties: all must appear (AND)
     # edit cases.csv down to the cases you care about
     unicourt get-complaints --input-file cases.csv --dry-run --out documents.csv
     unicourt get-complaints --input-file cases.csv            # free documents only
     unicourt get-complaints --input-file cases.csv --dry-run --include-paid --budget 25
 
+    # or straight from a search:
+    unicourt search --state "New York" --court-type state --party "Acme" | unicourt get-complaints --dry-run
+
+Search scope: --state (and --county), --court-type state|federal, and/or one
+court (--court-id / --court-name); at least one is required.
+
 Downloading paid documents is not supported: --include-paid only plans and
 prices them in a dry run; without --dry-run it stops with an error.
-
-    # or straight from a search:
-    unicourt search --court-id CORT... --party "Acme" | unicourt get-complaints --dry-run
 """
 
 from __future__ import annotations
@@ -153,8 +157,8 @@ def _add_auth(p: argparse.ArgumentParser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="unicourt",
-        description="Find state-court cases by party, then price or download their "
-        "cover sheets / complaints and list the plaintiffs.",
+        description="Find cases by party in a state, county, court type (state or federal) "
+        "or court, then price or download their cover sheets / complaints and list the plaintiffs.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 

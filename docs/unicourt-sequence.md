@@ -70,7 +70,7 @@ sequenceDiagram
     T->>U: GET masterData/court?q=name:"..." (resolve state courtId)
     T->>U: GET masterData/courtServiceStatus (skip courts that are down)
     loop each query page (sort=filedDate, max 1000 pages)
-        T->>U: GET caseSearch?q=Party:(defendant name + role) AND Court AND filedDate
+        T->>U: GET caseSearch?q=Party:(defendant + role) AND JurisdictionGeo:(state) AND Court:(type:"State")
         U-->>T: caseId, caseNumber, caseName, matchedObjectArray
     end
     opt coordination order or master case number known

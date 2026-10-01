@@ -204,9 +204,10 @@ Complaints are de-duplicated by document id across entries.
 
 ## State-court plaintiffs via UniCourt (`unicourt`)
 
-A separate tool that uses the UniCourt DEEP API. It finds cases in **one state
-court** that name one or more parties, and saves them as a case list you can
-edit or pipe. For the cases on that list it inventories and prices every
+A separate tool that uses the UniCourt DEEP API. It finds cases that name one
+or more parties, scoped by **jurisdiction** (state, optionally county), **court
+type** (state or federal) or a **single court**, and saves them as a case list
+you can edit or pipe. For the cases on that list it inventories and prices every
 filing, downloads the **free** cover sheets or complaints (paid ones
 are priced and planned, but downloading them is not supported) and writes the
 plaintiffs named in them to CSV.
@@ -269,9 +270,8 @@ rather than in chat.
 ### Workflow
 
 ```console
-$ unicourt courts "Los Angeles"                                   # 1. find the courtId
-$ unicourt search --court-id CORT... --party "Pfizer" \
-      --party "Pharmacia" --limit 0 --out cases.csv               # 2. save the cases
+$ unicourt search --state "New York" --court-type state \
+      --party "Pfizer" --party "Pharmacia" --limit 0 --out cases.csv  # 1-2. save the cases
                                                                   # 3. edit cases.csv
 $ unicourt get-complaints -i cases.csv --dry-run                  # 4. plan and price, fetch nothing
 $ unicourt get-complaints -i cases.csv --limit 1                  # 5. free documents, one case first
@@ -283,8 +283,11 @@ $ unicourt get-complaints -i cases.csv --dry-run \
 Or skip the file and pipe a search straight in:
 
 ```console
-$ unicourt search --court-id CORT... --party "Pfizer" | unicourt get-complaints --dry-run
+$ unicourt search --state "New York" --court-type state --party "Pfizer" | unicourt get-complaints --dry-run
 ```
+
+To search one court instead, find its ID with `unicourt courts "Los Angeles"`
+and pass `--court-id`.
 
 **2. `search`** shows a table in a terminal and writes CSV when its output is
 piped (`--format table|csv` forces either). `--out` also saves the CSV, which

@@ -280,8 +280,8 @@ Caching rules:
 - CLI: a `--source {courtlistener,unicourt}` flag. PACER is off unless
   `--allow-pacer` is given, together with `--pacer-user`, `--client-code` and
   `--max-spend`. Credentials come from `UNICOURT_CLIENT_ID` /
-  `UNICOURT_CLIENT_SECRET` (the token is created and stored automatically),
-  `UNICOURT_WORKSPACE`, and `PACER_USER_ID` for tier 3.
+  `UNICOURT_CLIENT_SECRET` (the DEEP workspace is looked up and the token is
+  created and stored automatically), and `PACER_USER_ID` for tier 3.
 - Tests: fixtures cut from the spec's own response examples
   (`CaseApiRelatedCasesResponse`, `CaseApiPartiesResponse`, and others), so the
   suite stays offline.
