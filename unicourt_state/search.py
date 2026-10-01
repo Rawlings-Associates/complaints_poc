@@ -1,4 +1,4 @@
-"""Case search: cases in one state court that name one or more parties."""
+"""Case search: cases naming one or more parties, by court, jurisdiction and court type."""
 
 from __future__ import annotations
 
@@ -29,38 +29,64 @@ def party_clause(name: str, role: str | None = None) -> str:
     return f"(Party:({inner}))"
 
 
+COURT_TYPES = {"state": "State", "federal": "Federal"}
+MATCH_JOINERS = {"all": " AND ", "and": " AND ", "any": " OR ", "or": " OR "}
+
+
 def build_query(
     parties: Iterable[str],
     court_id: str | None = None,
     court_name: str | None = None,
-    match: str = "any",
+    match: str = "all",
     role: str | None = None,
     filed_from: str | None = None,
     filed_to: str | None = None,
+    state: str | None = None,
+    county: str | None = None,
+    court_type: str | None = None,
 ) -> str:
     """Build a caseSearch `q` expression.
 
-    ``match="any"`` finds cases naming at least one of the parties;
-    ``match="all"`` requires every party to appear.
+    Parties: ``match="all"`` (or ``"and"``, the default) requires every party
+    to appear; ``"any"`` (or ``"or"``) finds cases naming at least one.
+
+    Scope, combined with AND; at least one is required so a search is never
+    accidentally nationwide:
+    - ``court_id`` / ``court_name``: one court.
+    - ``state`` (and optionally ``county``): the jurisdiction, as
+      ``JurisdictionGeo:(state:"...")``.
+    - ``court_type``: ``"state"`` or ``"federal"``, as ``Court:(type:"State")``.
     """
     names = [p.strip() for p in parties if p and p.strip()]
     if not names:
         raise ValueError("at least one party name is required")
-    if not (court_id or court_name):
-        raise ValueError("a court is required (courtId or court name)")
-    if match not in ("any", "all"):
-        raise ValueError("match must be 'any' or 'all'")
+    if match not in MATCH_JOINERS:
+        raise ValueError("match must be 'all'/'and' or 'any'/'or'")
+    if court_type is not None and court_type.lower() not in COURT_TYPES:
+        raise ValueError("court type must be 'state' or 'federal'")
+    if county and not state:
+        raise ValueError("--county needs --state")
+    if not (court_id or court_name or state or court_type):
+        raise ValueError("give a scope: a court (--court-id/--court-name), a jurisdiction "
+                         "(--state), a court type (--court-type), or a combination")
 
-    joiner = " OR " if match == "any" else " AND "
     clauses = [party_clause(n, role) for n in names]
-    party_expr = clauses[0] if len(clauses) == 1 else "(" + joiner.join(clauses) + ")"
+    party_expr = clauses[0] if len(clauses) == 1 else "(" + MATCH_JOINERS[match].join(clauses) + ")"
 
+    scope = []
     if court_id:
-        court_expr = f"(Court:(courtId:{_quote(court_id)}))"
-    else:
-        court_expr = f"(Court:(name:{_quote(court_name)}))"
+        scope.append(f"(Court:(courtId:{_quote(court_id)}))")
+    elif court_name:
+        scope.append(f"(Court:(name:{_quote(court_name)}))")
+    if court_type:
+        scope.append(f"(Court:(type:{_quote(COURT_TYPES[court_type.lower()])}))")
+    if state:
+        geo = f"state:{_quote(state)}"
+        if county:
+            geo += f" AND county:{_quote(county)}"
+        scope.append(f"(JurisdictionGeo:({geo}))")
 
-    parts = [party_expr, court_expr]
+    parts = [party_expr, *scope]
     if filed_from or filed_to:
         start = f"{filed_from}T00:00:00" if filed_from else "*"
         end = f"{filed_to}T23:59:59" if filed_to else "*"

@@ -13,7 +13,7 @@ from typing import Any, Iterable
 from . import documents as docs_mod
 from .documents import Candidate, is_sealed, price_of
 
-CASE_FIELDS = ["case_id", "case_number", "case_name", "court", "filed_date"]
+CASE_FIELDS = ["case_id", "case_number", "case_name", "court", "court_type", "state", "filed_date"]
 
 INVENTORY_FIELDS = CASE_FIELDS + [
     "case_document_id", "document_name", "document_description", "document_filed_date",
@@ -67,6 +67,8 @@ def case_record(case: dict[str, Any]) -> dict[str, str]:
         "case_number": case.get("caseNumber", ""),
         "case_name": case.get("caseName") or "",
         "court": (case.get("court") or {}).get("name", ""),
+        "court_type": (case.get("court") or {}).get("type", "") or "",
+        "state": (case.get("courtLocation") or {}).get("stateName", "") or "",
         "filed_date": (case.get("filedDate") or "")[:10],
     }
 

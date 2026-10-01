@@ -173,13 +173,21 @@ def build_parser() -> argparse.ArgumentParser:
     _add_auth(p)
 
     p = sub.add_parser("search", help="find cases by party; CSV output can feed get-complaints")
-    court = p.add_mutually_exclusive_group(required=True)
-    court.add_argument("--court-id", help="UniCourt courtId (find it with the `courts` command)")
-    court.add_argument("--court-name", help="exact court name, e.g. 'Los Angeles County Superior Court'")
+    scope = p.add_argument_group("scope (at least one; they combine with AND)")
+    court = scope.add_mutually_exclusive_group()
+    court.add_argument("--court-id", help="one court, by UniCourt courtId (see the `courts` command)")
+    court.add_argument("--court-name", help="one court, by exact name, e.g. 'Los Angeles County Superior Court'")
+    scope.add_argument("--state", metavar="NAME",
+                       help="jurisdiction: a state, by full name, e.g. 'New York'")
+    scope.add_argument("--county", metavar="NAME",
+                       help="jurisdiction: a county within --state, e.g. 'Kings'")
+    scope.add_argument("--court-type", choices=("state", "federal"), type=str.lower,
+                       help="only state courts or only federal courts")
     p.add_argument("--party", action="append", required=True, metavar="NAME",
                    help="party name; repeat for several parties")
-    p.add_argument("--match", choices=("any", "all"), default="any",
-                   help="cases naming any of the parties (default) or all of them")
+    p.add_argument("--match", choices=("all", "and", "any", "or"), default="all",
+                   help="several parties: all/and = every party must appear (default); "
+                   "any/or = at least one")
     p.add_argument("--role", help="only match the parties in this role, e.g. defendant")
     p.add_argument("--filed-from", metavar="YYYY-MM-DD")
     p.add_argument("--filed-to", metavar="YYYY-MM-DD")
@@ -359,6 +367,7 @@ def cmd_search(args) -> int:
         return build_query(
             args.party, court_id=args.court_id, court_name=args.court_name, match=args.match,
             role=args.role, filed_from=filed_from, filed_to=filed_to,
+            state=args.state, county=args.county, court_type=args.court_type,
         )
 
     _err(f"q = {make_query(args.filed_from, args.filed_to)}")
@@ -401,7 +410,8 @@ def read_cases(fh: TextIO, source: str = "input") -> list[dict[str, Any]]:
             "caseId": case_id,
             "caseNumber": col(row, "case_number"),
             "caseName": col(row, "case_name"),
-            "court": {"name": col(row, "court")},
+            "court": {"name": col(row, "court"), "type": col(row, "court_type")},
+            "courtLocation": {"stateName": col(row, "state")},
             "filedDate": col(row, "filed_date"),
         })
     return cases

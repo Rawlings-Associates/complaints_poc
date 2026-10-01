@@ -103,13 +103,40 @@ class BuildQueryTests(unittest.TestCase):
         q = build_query(["Pfizer Inc"], court_id="CORTabc")
         self.assertEqual(q, '(Party:(name:"Pfizer Inc")) AND (Court:(courtId:"CORTabc"))')
 
-    def test_any_vs_all_and_role(self):
+    def test_all_is_the_default_and_any_is_or(self):
         q = build_query(["Pfizer", "Pharmacia"], court_name="X Court", role="defendant")
-        self.assertIn(" OR ", q)
+        self.assertIn(') AND (Party:', q)                 # default: every party (AND)
+        self.assertNotIn(" OR ", q)
         self.assertIn('(PartyRole:(name:"defendant"))', q)
         self.assertIn('(Court:(name:"X Court"))', q)
-        q = build_query(["Pfizer", "Pharmacia"], court_id="C", match="all")
-        self.assertIn(') AND (Party:', q)
+        for match in ("any", "or"):
+            self.assertIn(") OR (Party:", build_query(["Pfizer", "Pharmacia"], court_id="C", match=match))
+        self.assertEqual(build_query(["A", "B"], court_id="C", match="and"),
+                         build_query(["A", "B"], court_id="C", match="all"))
+
+    def test_jurisdiction_and_court_type_scope(self):
+        q = build_query(["Pfizer"], state="New York", court_type="state")
+        self.assertEqual(q, '(Party:(name:"Pfizer")) AND (Court:(type:"State")) '
+                            'AND (JurisdictionGeo:(state:"New York"))')
+        q = build_query(["Pfizer"], state="Florida", county="Charlotte", court_type="federal")
+        self.assertIn('(JurisdictionGeo:(state:"Florida" AND county:"Charlotte"))', q)
+        self.assertIn('(Court:(type:"Federal"))', q)
+        q = build_query(["Pfizer"], court_id="CORT1", court_type="state")  # scopes combine
+        self.assertIn('(Court:(courtId:"CORT1")) AND (Court:(type:"State"))', q)
+
+    def test_scope_validation(self):
+        with self.assertRaises(ValueError):
+            build_query(["A"])                                  # no scope at all
+        with self.assertRaises(ValueError):
+            build_query(["A"], county="Kings")                  # county without state
+        with self.assertRaises(ValueError):
+            build_query(["A"], court_type="tribal")
+        self.assertTrue(build_query(["A"], court_type="state"))  # court type alone is a scope
+
+    def test_cli_parses_scope_and_match(self):
+        args = cli.build_parser().parse_args(
+            ["search", "--state", "New York", "--court-type", "Federal", "--party", "A", "--party", "B"])
+        self.assertEqual((args.state, args.court_type, args.match, args.court_id), ("New York", "federal", "all", None))
 
     def test_dates(self):
         q = build_query(["A"], court_id="C", filed_from="2024-01-01")
@@ -122,8 +149,6 @@ class BuildQueryTests(unittest.TestCase):
     def test_validation(self):
         with self.assertRaises(ValueError):
             build_query([], court_id="C")
-        with self.assertRaises(ValueError):
-            build_query(["A"])
         with self.assertRaises(ValueError):
             build_query(["x" * 2000], court_id="C")
 
@@ -451,6 +476,7 @@ class CaseListTests(unittest.TestCase):
     def _search(self, tmp, fmt="auto", out=None):
         client = FakeClient({("GET", "caseSearch"): {"caseSearchResultArray": [CASE], "totalCount": 7}})
         args = SimpleNamespace(court_id="C", court_name=None, party=["Pfizer"], match="any",
+                               state=None, county=None, court_type=None,
                                role=None, filed_from=None, filed_to=None, limit=1, format=fmt,
                                out=out, token="t", workspace="w", verbose=False)
         stdout, err = io.StringIO(), io.StringIO()

@@ -287,10 +287,29 @@ $ unicourt search --court-id CORT... --party "Pfizer" | unicourt get-complaints 
 ```
 
 **2. `search`** shows a table in a terminal and writes CSV when its output is
-piped (`--format table|csv` forces either). `--out` also saves the CSV to a
-file. Other options:
+piped (`--format table|csv` forces either). `--out` also saves the CSV, which
+includes each case's `court_type` and `state`, to a file.
 
-- `--match all`: every party must appear in the case.
+**Where to search.** Give at least one scope; the scopes combine with AND, so
+a search is never nationwide by accident:
+
+| Option | Searches | Sent to UniCourt as |
+| --- | --- | --- |
+| `--state "New York"` | One jurisdiction (the full state name) | `(JurisdictionGeo:(state:"New York"))` |
+| `--county "Kings"` (with `--state`) | One county in that state | `(JurisdictionGeo:(state:"New York" AND county:"Kings"))` |
+| `--court-type state` / `federal` | Only state courts, or only federal courts | `(Court:(type:"State"))` |
+| `--court-id` / `--court-name` | One court | `(Court:(courtId:"..."))` |
+
+```console
+$ unicourt search --state "New York" --court-type state --party "Pfizer" --party "Pharmacia"
+```
+
+**Parties.** With several `--party` names, **every** party must appear in the
+case (`--match all`, also written `and`; this is the default). Use
+`--match any` (or `or`) to find cases naming at least one of them.
+
+Other options:
+
 - `--role defendant`: match the parties only in that role.
 - `--filed-from` / `--filed-to`: limit by filing date.
 - `--limit`: defaults to 100 cases; `0` returns all of them.
