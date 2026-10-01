@@ -202,6 +202,255 @@ guessed at, so bad input stays visible.
 
 Complaints are de-duplicated by document id across entries.
 
+## State-court plaintiffs via UniCourt (`unicourt`)
+
+A separate tool that uses the UniCourt DEEP API. It finds cases in **one state
+court** that name one or more parties, and saves them as a case list you can
+edit or pipe. For the cases on that list it inventories and prices every
+filing, downloads the **free** cover sheets or complaints (paid ones
+are priced and planned, but downloading them is not supported) and writes the
+plaintiffs named in them to CSV.
+
+### Setup
+
+```console
+$ pip install -e .                                   # installs the `unicourt` command and pypdf
+$ export UNICOURT_CLIENT_ID=... UNICOURT_CLIENT_SECRET=... UNICOURT_WORKSPACE=...
+$ unicourt token                                     # optional: create the token now
+```
+
+You never handle the access token yourself.
+
+1. **First run:** the first command that needs the API exchanges your client
+   ID and secret for a **workspace token** (`POST /generateNewWorkspaceToken`).
+2. **Storage:** it saves the token to `~/.config/unicourt/credentials.json`.
+   The file is readable only by you (permissions 600, in a 700 directory) and
+   is written atomically. It holds the token, its ID, the workspace ID, the
+   creation time and a hash of the client ID. **The client secret is never
+   written anywhere.**
+3. **Later runs** reuse the stored token, so they need no environment
+   variables at all. Tokens never expire, and a workspace may hold at most 10,
+   so one is created once rather than on every run.
+4. **A rejected token:** if UniCourt rejects the stored token (it was
+   revoked), a new one is created automatically, provided the client ID and
+   secret are in the environment.
+
+| Variable | Needed | Purpose |
+| --- | --- | --- |
+| `UNICOURT_CLIENT_ID`, `UNICOURT_CLIENT_SECRET` | To create the token, then only to replace or revoke it | If unset in a terminal, you are asked (the secret is hidden) |
+| `UNICOURT_WORKSPACE` | First run only; it is stored with the token | Or pass `--workspace` |
+| `UNICOURT_TOKEN` | Never | Uses this token instead of the stored one (needs a workspace) |
+| `UNICOURT_CREDENTIALS_FILE` | Never | Stores the token somewhere else |
+| `UNICOURT_API_ROOT` | Never | Base URL (default `https://deep-api.unicourt.com`) |
+
+Managing the stored token. These commands never print the token itself:
+
+```console
+$ unicourt token              # status: workspace, token ID, created, file path
+$ unicourt token --refresh    # new token, then the old one is revoked with UniCourt
+$ unicourt token --revoke     # revoke with UniCourt and delete the local copy
+```
+
+In a cloud session the home directory is temporary, so a new session creates
+a new token. Run `unicourt token --revoke` at the end of a session, or set
+`UNICOURT_CREDENTIALS_FILE` to a persistent location, to stay under the
+10-token limit. Put the client ID and secret in the environment's secrets
+rather than in chat.
+
+`python -m unicourt_state ...` works the same without installing.
+
+### Workflow
+
+```console
+$ unicourt courts "Los Angeles"                                   # 1. find the courtId
+$ unicourt search --court-id CORT... --party "Pfizer" \
+      --party "Pharmacia" --limit 0 --out cases.csv               # 2. save the cases
+                                                                  # 3. edit cases.csv
+$ unicourt get-complaints -i cases.csv --dry-run                  # 4. plan and price, fetch nothing
+$ unicourt get-complaints -i cases.csv --limit 1                  # 5. free documents, one case first
+$ unicourt get-complaints -i cases.csv                            #    then the rest
+$ unicourt get-complaints -i cases.csv --dry-run \
+      --include-paid --budget 25                                  # 6. plan paid ones within $25
+```
+
+Or skip the file and pipe a search straight in:
+
+```console
+$ unicourt search --court-id CORT... --party "Pfizer" | unicourt get-complaints --dry-run
+```
+
+**2. `search`** shows a table in a terminal and writes CSV when its output is
+piped (`--format table|csv` forces either). `--out` also saves the CSV to a
+file. Other options:
+
+- `--match all`: every party must appear in the case.
+- `--role defendant`: match the parties only in that role.
+- `--filed-from` / `--filed-to`: limit by filing date.
+- `--limit`: defaults to 100 cases; `0` returns all of them.
+
+**Pagination.** Every list call starts at `pageNumber=1` and follows
+`nextPageAPI` until it is null. Page sizes are fixed by UniCourt: 10 per page
+for case search, 100 for documents.
+
+- **The 10,000-case cap:** a query is capped at 1,000 pages, so a case search
+  reaches at most 10,000 cases.
+- **Automatic splitting:** when a search matches more than that, `search`
+  splits it into filing-date ranges (halving until every range fits),
+  searches the ranges newest first, and removes duplicates. Each split prints
+  a note.
+- **When it can't split:** if a single day still matches more than 10,000
+  cases, it warns and returns the first 10,000. Narrow the search.
+- **Cases with no filing date** can't be reached once a search is split by
+  date.
+
+**3. Edit the list.** Only `case_id` is required, so any CSV with that column
+works, from `-i/--input-file` or from stdin.
+
+**4. `get-complaints --dry-run`** lists every document of every case and
+matches them **by name similarity**:
+
+- A **civil cover sheet** ("Civil Case Cover Sheet", "Case Information Sheet"
+  and similar), then a **complaint** ("Complaint for Damages", "Original
+  Petition" and similar).
+- Look-alikes such as "Answer to Complaint", "Cross-Complaint" and "Proof of
+  Service" are excluded.
+
+Nothing is ordered or downloaded. It writes **`--out` (default
+`documents.csv`)**, which has one row per document, including the ones that
+matched nothing. Each row carries the case, the document name and
+description, filing date, pages, **price**, repository, availability, preview
+availability, the type it matched and its score, and the planned **action**:
+
+| Action | Meaning |
+| --- | --- |
+| `download` | Free: downloaded |
+| `fallback` | Free: downloaded only if the documents before it yield no plaintiffs |
+| `buy` | Priced, within `--budget` (dry-run plan only) |
+| `buy-fallback` | Priced: needed only if the documents before it yield no plaintiffs (plan only) |
+| `over-budget` | Priced: would exceed `--budget` |
+| `paid-skip` | Priced: not downloaded |
+| `unknown-price` | No price given: never fetched |
+| `sealed` | Sealed: never fetched |
+| `alternative` | A weaker match of a type already covered: not fetched |
+| *(blank)* | Not a cover sheet or complaint |
+| `no-documents` | The case lists no documents |
+
+A real run fills in `result` (`downloaded`, `declined`, `failed` or
+`paid-not-supported`), `pdf_path` and `plaintiffs_found` on the same rows.
+
+The summary (illustrative):
+
+```console
+Summary for 6 case(s), 8 document(s) listed (dry run: nothing was ordered or downloaded):
+  civil-cover-sheet  found    1 | free    1 | paid    0 ($0.00) | price unknown 0 | sealed 0 | none 5
+  complaint          found    4 | free    1 | paid    2 ($3.70) | price unknown 1 | sealed 0 | none 2
+  Cases with a free document: 2
+  Cases with only paid documents: 1 (cheapest document per case: $2.50 in total)
+  Cases with nothing usable: 3
+  Paid documents are not downloaded (downloading them is not supported).
+```
+
+How to read it:
+
+- The `paid` figure on each line is the cost of every priced document of that
+  type, so the complaint line answers "what would all the complaints cost".
+- Add `--include-paid --budget N` to a dry run to see which paid documents
+  would be needed and which would go over the budget. This is a plan only.
+- Use `--doc-types complaint` to look at complaints only.
+- Prices are what UniCourt reports for each document at the court/source.
+  UniCourt's own charges, if any, are not included.
+
+**5. Without `--dry-run`**, only **free** documents are downloaded:
+
+1. **Free means a price of exactly `0`.** A missing or unreadable price counts
+   as not free.
+2. **The price is re-checked.** Right before any order or download the
+   document is fetched again (`GET caseDocument/{id}`) and the price checked a
+   second time. If it is no longer within the cap, nothing is ordered.
+3. **Each case is confirmed before anything downloads.** One prompt per case
+   lists the free documents it would fetch: `y`, `n`, `a` (yes to all), or
+   `q` (quit). The prompts come before the downloads start, so they never mix
+   with download output. They read from the terminal even when the case list
+   is piped in. `--yes` skips them. With no terminal and no `--yes`, nothing
+   is downloaded.
+4. **The PDF is fetched.** A free document already stored by UniCourt
+   downloads directly. One still at the court is ordered (`reOrder: false`),
+   polled until complete, then downloaded. PDFs are saved as
+   `pdfs/{caseNumber}_{type}_{documentId}.pdf`.
+5. **The plaintiffs are read** from the first document that names them: the
+   cover sheet's plaintiff label or case name, or the complaint caption. The
+   next planned document is tried only if the earlier ones yield none.
+
+**Workers and progress.** Cases run in parallel on `--workers N` threads
+(default 4, maximum 16). The threads list documents first, then download, so
+one slow court order no longer holds up the others. Each event prints as it
+happens, and a status line keeps count:
+
+```console
+  25STCV03  fetching complaint 'COMPLAINT FOR DAMAGES'
+  25STCV03  complaint order IN_PROGRESS
+  25STCV03  complaint order COMPLETE
+  25STCV03  saved pdfs/25STCV03_complaint_C1.pdf: 2 plaintiff(s)
+[Downloading: 4/6 cases | 2 active | 2 waiting on court orders | 4 PDFs, 8 plaintiffs | 0m48s]
+```
+
+- **In a terminal**, the status line stays at the bottom and updates every
+  second.
+- **When output goes to a file or a pipe**, it is printed as a plain line
+  every 30 seconds instead.
+- **Ctrl-C** stops cleanly: queued cases are cancelled, workers waiting on a
+  court order stop waiting, and the CSVs keep everything finished so far.
+- **CSV order:** both CSVs are written in case-list order, however the
+  workers finish.
+
+**Rate limit.** UniCourt allows **30 requests per 5 seconds** per account, so
+every API call goes through one shared limiter. However many workers run, no
+5-second window ever holds more than 30 requests.
+
+- **If UniCourt answers 429 anyway** (HTTP 429, or a body of
+  `{"code": "UN429"}` / `{"message": "Too Many Requests"}`), the client pauses
+  all workers for the `Retry-After` time, or a full 5-second window, and
+  retries up to 6 times. Rate-limited calls are not billable.
+- **PDF downloads don't count:** they come from signed storage links, not the
+  API.
+- **The run's last line** reports any time spent waiting on the limit and any
+  429s.
+- **The limit is per account**, so two runs at the same time share it. Each
+  stays under 30 per 5 seconds on its own, so together they can trigger 429s,
+  which are then retried.
+
+**6. Paid documents are not downloaded.** `--include-paid --budget AMOUNT`
+works only with `--dry-run`, where it plans and prices the paid cover sheets
+or complaints a case would need, within the budget. Without `--dry-run`,
+`--include-paid` stops at once with:
+
+```console
+Error: Downloading paid documents is not supported. Only free documents (price 0) can be downloaded; use --dry-run with --include-paid --budget to plan and price paid ones.
+```
+
+The same error guards the download code itself. A document whose price is
+not 0, when listed or when re-checked just before fetching, is never ordered.
+In a real run it is recorded as `paid-not-supported`.
+
+`--plaintiffs-out` (default `plaintiffs.csv`) has one row per plaintiff, or one
+row per case with a `status` when none were found: `no-matching-document`,
+`no-free-document`, `declined`, `download-failed`, `paid-not-supported`,
+`no-text-layer` (a scanned PDF; OCR is not done) or
+`no-plaintiffs-found`. Both CSVs are rewritten after every case, so an
+interrupted run keeps its progress.
+
+To re-parse a PDF you already have:
+`unicourt extract file.pdf --doc-type complaint`.
+
+### Reference material
+
+| Path | What it is |
+| --- | --- |
+| [`docs/unicourt-retrieval.md`](docs/unicourt-retrieval.md) | The retrieval plan: endpoints, costs, error codes |
+| [`docs/unicourt-sequence.md`](docs/unicourt-sequence.md) | The sequence diagram |
+| [`docs/unicourt-deep-v3-api-docs/`](docs/unicourt-deep-v3-api-docs/INDEX.md) | UniCourt's DEEP v3 developer docs, archived 2026-10-01 |
+| [`docs/unicourt-sdk/`](docs/unicourt-sdk/README.md) | UniCourt's official Python SDK wheel (`unicourt` 1.0), for reference only. This tool does not use it. |
+
 ## Tests
 
 Run entirely from saved fixtures — **no API requests**:
