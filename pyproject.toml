@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "complaints-poc"
+version = "0.1.0"
+description = "MDL member cases and state-court complaints via CourtListener and UniCourt"
+requires-python = ">=3.9"
+dependencies = ["pypdf>=4"]
+
+[project.scripts]
+unicourt = "unicourt_state.cli:main"
+
+[tool.setuptools]
+packages = ["mdl_complaints", "unicourt_state"]

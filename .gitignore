@@ -6,3 +6,8 @@ venv/
 .cache/
 pdfs/
 *.pdf
+plaintiffs*.csv
+texts*.jsonl
+documents*.csv
+cases*.csv
+.venv-*/
