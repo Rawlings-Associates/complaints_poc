@@ -574,5 +574,64 @@ class TestCaseNumberNormalization(unittest.TestCase):
         self.assertEqual(normalize_case_number("not-a-case"), "not-a-case")
 
 
+class TestAllDocuments(unittest.TestCase):
+    """Complaints are often mislabelled, so any document must be reachable."""
+
+    def _collect(self, **kwargs):
+        _, _, docs, _ = collect_complaints(FakeClient(), "3140", with_titles=False, **kwargs)
+        return docs
+
+    def test_default_keeps_only_labelled_complaints(self):
+        docs = self._collect()
+        self.assertTrue(all(d.labelled_complaint for d in docs))
+        self.assertEqual(len(docs), 28)
+
+    def test_all_documents_keeps_every_document(self):
+        fixture = FakeClient().entries["results"]
+        total = sum(len(e.get("recap_documents") or []) for e in fixture)
+        docs = self._collect(all_documents=True)
+        self.assertEqual(len(docs), total)
+        self.assertEqual(sum(d.labelled_complaint for d in docs), 28)
+
+    def test_main_filing_is_described_by_its_entry(self):
+        docs = self._collect(all_documents=True)
+        main = next(d for d in docs if d.entry_number == 1 and d.attachment_number is None)
+        self.assertTrue(main.description.startswith("MOTION TO TRANSFER"))
+        self.assertEqual(main.case_number, "")
+
+    def test_mislabelled_complaint_keeps_its_case_number(self):
+        docs = self._collect(all_documents=True)
+        exhibit = next(d for d in docs if d.description.startswith("Exhibit A"))
+        self.assertFalse(exhibit.labelled_complaint)
+        self.assertEqual((exhibit.court_code, exhibit.case_number), ("FLN", "3:24-00624"))
+        self.assertEqual(exhibit.case_number_normalized, "3:24-cv-00624")
+
+    def test_doc_match_finds_complaints_under_any_label(self):
+        docs = self._collect(doc_match="complaint")
+        self.assertEqual(sum(d.labelled_complaint for d in docs), 28)
+        self.assertIn("Exhibit A", " ".join(d.description for d in docs))
+        self.assertNotIn("Proof of Service", [d.description for d in docs])
+
+    def test_doc_match_is_case_insensitive_regex(self):
+        docs = self._collect(doc_match="^(brief|exhibit)")
+        self.assertEqual(
+            sorted(d.description.split()[0] for d in docs), ["Brief", "Brief", "Exhibit"]
+        )
+
+    def test_download_names_do_not_collide(self):
+        from mdl_complaints.cli import _pdf_filename
+
+        docs = self._collect(all_documents=True)
+        names = [_pdf_filename(d, all_documents=True) for d in docs]
+        self.assertEqual(len(names), len(set(names)))
+        self.assertTrue(all("/" not in n and ":" not in n for n in names))
+
+    def test_complaint_download_names_are_unchanged(self):
+        from mdl_complaints.cli import _pdf_filename
+
+        first = self._collect()[0]
+        self.assertEqual(_pdf_filename(first), "CAN_3-24-6875.pdf")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

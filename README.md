@@ -141,6 +141,8 @@ python3 -m mdl_complaints 3140 --members --court flnd --format csv > members.csv
 python3 -m mdl_complaints 3140                            # complaints
 python3 -m mdl_complaints 3140 --motions-only             # 2-request fast path
 python3 -m mdl_complaints 3140 --download ./pdfs          # fetch the PDFs
+python3 -m mdl_complaints 3140 --all-documents --download ./pdfs   # every document
+python3 -m mdl_complaints 3140 --doc-match 'complaint|exhibit' --download ./pdfs
 python3 -m mdl_complaints 3140 -v                         # log requests
 ```
 
@@ -159,6 +161,8 @@ python3 -m mdl_complaints 3140 -v                         # log requests
 | `--max-pages` | `0` | pages of docket entries to scan, 20 per page (0 = all) |
 | `--no-titles` / `--no-pdf-titles` | titles on | skip caption lookup / PDF fallback |
 | `--available-only` | off | skip complaints with no PDF in RECAP |
+| `--all-documents` | off | every document, not just ones labelled `Complaint` |
+| `--doc-match REGEX` | none | documents whose description matches (case-insensitive) |
 | `--download DIR` | off | download PDFs (storage host, not rate limited) |
 | `--rate` | `10` | max API requests per minute |
 | `--no-cache` / `--cache-dir` | cache on | `~/.cache/mdl_complaints` |
@@ -201,6 +205,26 @@ guessed at, so bad input stays visible.
   Oral Argument Statement and Proof of Service.
 
 Complaints are de-duplicated by document id across entries.
+
+### Mislabelled complaints: downloading any document
+
+Filers do not always label a complaint `Complaint`. On 3140, entry 24 carries
+`Exhibit A Docket Sheet & Complaint - FLN/3:24-00624`, which the default filter
+skips. Two flags widen the net, and both work with `--download`:
+
+- `--all-documents` keeps **every** document on the matching entries: main
+  filings (described by their entry text) and all attachments.
+- `--doc-match REGEX` keeps documents whose description matches, whatever
+  their label, e.g. `--doc-match 'complaint|exhibit'`. Note that a main
+  filing's description is its entry text, which may mention a complaint too.
+
+In these modes the table gains a Description column, each row carries
+`labelled_complaint` (whether the docket called it a complaint), and a court
+and case number written anywhere in the description (`FLN/3:24-00624`) is
+picked up. Downloads are named
+`<entry>-<attachment>_<document id>[_<court>_<case>]_<description>.pdf`, so
+several documents for one case never overwrite each other. The default
+complaint-only names are unchanged.
 
 ## Tests
 

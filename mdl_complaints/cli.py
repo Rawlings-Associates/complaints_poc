@@ -12,6 +12,7 @@ import csv
 from collections import Counter
 import json
 import os
+import re
 import sys
 import time
 import urllib.request
@@ -120,8 +121,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="only complaints whose PDF is available in RECAP",
     )
     parser.add_argument(
+        "--all-documents", action="store_true",
+        help=(
+            "list (and with --download, fetch) every document on the matching "
+            "entries, not just attachments labelled 'Complaint'. Complaints "
+            "are often mislabelled, e.g. 'Exhibit A Docket Sheet & Complaint'"
+        ),
+    )
+    parser.add_argument(
+        "--doc-match", metavar="REGEX",
+        help=(
+            "only documents whose description matches REGEX "
+            "(case-insensitive), whatever their label, e.g. 'complaint|exhibit'"
+        ),
+    )
+    parser.add_argument(
         "--download", metavar="DIR",
-        help="also download the complaint PDFs into DIR",
+        help="also download the listed PDFs into DIR",
     )
     parser.add_argument(
         "--rate", type=int, default=10,
@@ -141,10 +157,15 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _render_table(complaints: list[Complaint], title_width: int = 46) -> str:
+def _render_table(
+    complaints: list[Complaint], title_width: int = 46, show_description: bool = False,
+) -> str:
     headers = ["#", "Entry", "Court", "Case No.", "Title", "Pg", "PDF"]
-    rows = [
-        [
+    if show_description:
+        headers.insert(2, "Description")
+    rows = []
+    for i, c in enumerate(complaints, 1):
+        row = [
             str(i),
             f"{c.entry_number or ''}-{c.attachment_number or ''}",
             c.court_name or c.court_code,
@@ -153,8 +174,9 @@ def _render_table(complaints: list[Complaint], title_width: int = 46) -> str:
             str(c.page_count or ""),
             "yes" if c.is_available else "no",
         ]
-        for i, c in enumerate(complaints, 1)
-    ]
+        if show_description:
+            row.insert(2, _clip(c.description, 40))
+        rows.append(row)
     widths = [
         max(len(h), *(len(r[col]) for r in rows)) if rows else len(h)
         for col, h in enumerate(headers)
@@ -293,7 +315,27 @@ def _write_csv(complaints: list[Complaint], stream) -> None:
         writer.writerow(complaint.as_dict())
 
 
-def _download(complaints: list[Complaint], directory: str, verbose: bool) -> int:
+def _pdf_filename(complaint: Complaint, all_documents: bool = False) -> str:
+    """Complaints are named by case; other documents also need the docket
+    position and id, since one case can have several documents (or none)."""
+    slug = (complaint.case_number or str(complaint.document_id)).replace(":", "-")
+    if not all_documents:
+        return f"{complaint.court_code or 'court'}_{slug}.pdf"
+    label = re.sub(r"[^A-Za-z0-9]+", "-", complaint.description[:40]).strip("-")
+    parts = [
+        f"{complaint.entry_number or 0:03d}-{complaint.attachment_number or 0:02d}",
+        str(complaint.document_id),
+        f"{complaint.court_code}_{complaint.case_number.replace(':', '-')}"
+        if complaint.case_number else "",
+        label,
+    ]
+    return "_".join(part for part in parts if part) + ".pdf"
+
+
+def _download(
+    complaints: list[Complaint], directory: str, verbose: bool,
+    all_documents: bool = False,
+) -> int:
     """Fetch the PDFs. These come from the storage host, not the rate-limited API."""
     target = Path(directory)
     target.mkdir(parents=True, exist_ok=True)
@@ -301,8 +343,7 @@ def _download(complaints: list[Complaint], directory: str, verbose: bool) -> int
     for complaint in complaints:
         if not complaint.pdf_url:
             continue
-        slug = (complaint.case_number or str(complaint.document_id)).replace(":", "-")
-        path = target / f"{complaint.court_code or 'court'}_{slug}.pdf"
+        path = target / _pdf_filename(complaint, all_documents)
         if path.exists():
             if verbose:
                 print(f"  [skip] {path.name} already downloaded", file=sys.stderr)
@@ -327,6 +368,13 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.motions_only and not args.entry_prefix:
         args.entry_prefix = DEFAULT_ENTRY_PREFIX
+    if args.doc_match:
+        try:
+            re.compile(args.doc_match)
+        except re.error as exc:
+            print(f"error: --doc-match is not a valid regex: {exc}", file=sys.stderr)
+            return 2
+    any_docs = args.all_documents or bool(args.doc_match)
 
     try:
         canonical = normalize_mdl_number(args.mdl)
@@ -359,6 +407,8 @@ def main(argv: list[str] | None = None) -> int:
             available_only=args.available_only,
             with_titles=not args.no_titles,
             pdf_fallback=not args.no_pdf_titles,
+            all_documents=args.all_documents,
+            doc_match=args.doc_match,
         )
     except DocketNotFound as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -376,6 +426,7 @@ def main(argv: list[str] | None = None) -> int:
                 "date_filed": docket.get("date_filed"),
                 "matching_entries": len(entries),
                 "complaint_count": len(complaints),
+                "all_documents": any_docs,
                 "truncated": truncated,
                 "complaints": [c.as_dict() for c in complaints],
             },
@@ -397,12 +448,16 @@ def main(argv: list[str] | None = None) -> int:
         )
         resolved = sum(1 for c in complaints if c.title)
         derived = sum(1 for c in complaints if c.title_source == "complaint-pdf")
+        noun = "documents" if any_docs else "complaints"
         print(
             f"Scope: {scope} | matching entries: {len(entries)} | "
-            f"complaints: {len(complaints)} | titles: {resolved}/{len(complaints)}"
+            f"{noun}: {len(complaints)} | titles: {resolved}/{len(complaints)}"
         )
         print()
-        print(_render_table(complaints) if complaints else "No complaints found.")
+        print(
+            _render_table(complaints, show_description=any_docs)
+            if complaints else f"No {noun} found."
+        )
         if derived:
             print(
                 f"\n* {derived} title(s) taken from the complaint PDF "
@@ -416,7 +471,7 @@ def main(argv: list[str] | None = None) -> int:
             )
 
     if args.download:
-        saved = _download(complaints, args.download, args.verbose)
+        saved = _download(complaints, args.download, args.verbose, any_docs)
         print(f"\nDownloaded {saved}/{len(complaints)} PDFs to {args.download}",
               file=sys.stderr)
 

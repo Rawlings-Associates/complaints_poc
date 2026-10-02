@@ -34,6 +34,11 @@ _CASE_RE = re.compile(
     re.IGNORECASE,
 )
 _MDL_DIGITS_RE = re.compile(r"(\d{2,5})")
+#: A court and case number anywhere in a description, e.g. the mislabelled
+#: ``Exhibit A Docket Sheet & Complaint - FLN/3:24-00624``.
+_EMBEDDED_CASE_RE = re.compile(
+    r"\b(?P<court>[A-Z]{2,5})\s*[/ ]\s*(?P<case>\d+:\d+-[\w-]*\d)"
+)
 
 
 class DocketNotFound(RuntimeError):
@@ -64,7 +69,12 @@ def normalize_mdl_number(raw: str) -> str:
 
 @dataclass
 class Complaint:
-    """One member-case complaint attached to a motion to transfer."""
+    """One document from the MDL docket.
+
+    Normally a member-case complaint attached to a motion to transfer; with
+    ``all_documents`` it can be any document, and ``labelled_complaint`` says
+    whether the docket itself called it a complaint.
+    """
 
     mdl_number: str
     entry_number: int | None
@@ -82,6 +92,7 @@ class Complaint:
     document_id: int
     pdf_url: str
     courtlistener_url: str
+    labelled_complaint: bool = True
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -132,6 +143,29 @@ def parse_complaint_description(text: str) -> tuple[str, str]:
     if not match:
         return "", ""
     return (match.group("court") or "").upper(), match.group("case") or ""
+
+
+def parse_document_description(text: str) -> tuple[str, str]:
+    """Like :func:`parse_complaint_description`, for any document.
+
+    Complaints are often filed under another label, so a court and case number
+    found anywhere in the description is used when the label is not
+    ``Complaint ...``.
+
+    >>> parse_document_description("Complaint CAN 3:24-6875")
+    ('CAN', '3:24-6875')
+    >>> parse_document_description("Exhibit A Docket Sheet & Complaint - FLN/3:24-00624")
+    ('FLN', '3:24-00624')
+    >>> parse_document_description("Proof of Service")
+    ('', '')
+    """
+    code, case_number = parse_complaint_description(text)
+    if case_number:
+        return code, case_number
+    match = _EMBEDDED_CASE_RE.search(text or "")
+    if not match:
+        return code, ""
+    return match.group("court"), match.group("case")
 
 
 def is_complaint(doc: dict[str, Any]) -> bool:
@@ -204,15 +238,24 @@ def collect_complaints(
     available_only: bool = False,
     with_titles: bool = True,
     pdf_fallback: bool = True,
+    all_documents: bool = False,
+    doc_match: str | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[Complaint], bool]:
     """Return ``(docket, matching_entries, complaints, truncated)``.
 
     ``entry_prefix`` of ``None`` scans every docket entry; pass
     ``"MOTION TO TRANSFER"`` to narrow to the motions that created the MDL.
     ``max_pages`` of 0 means "all pages".
+
+    Complaints are often mislabelled (``Exhibit A Docket Sheet & Complaint``),
+    so ``all_documents`` keeps every document -- main filings and attachments
+    alike -- rather than only those described as ``Complaint``.
+    ``doc_match`` keeps documents whose description matches that regular
+    expression (case-insensitive), whatever their label.
     """
     docket = find_docket(client, mdl_number)
     prefix = (entry_prefix or "").strip().upper()
+    pattern = re.compile(doc_match, re.IGNORECASE) if doc_match else None
 
     matching: list[dict[str, Any]] = []
     complaints: list[Complaint] = []
@@ -227,7 +270,13 @@ def collect_complaints(
             continue
         matching.append(entry)
         for doc in entry.get("recap_documents") or []:
-            if not is_complaint(doc):
+            labelled = is_complaint(doc)
+            # The main filing has no description of its own; the entry's is it.
+            label = (doc.get("description") or "").strip() or description
+            if pattern:
+                if not pattern.search(label):
+                    continue
+            elif not (all_documents or labelled):
                 continue
             if available_only and not doc.get("is_available"):
                 continue
@@ -235,7 +284,12 @@ def collect_complaints(
                 continue
             seen.add(doc["id"])
             texts[doc["id"]] = doc.get("plain_text") or ""
-            code, case_number = parse_complaint_description(doc.get("description") or "")
+            if labelled:
+                code, case_number = parse_complaint_description(label)
+            else:
+                code, case_number = parse_document_description(
+                    doc.get("description") or ""
+                )
             absolute = doc.get("absolute_url") or ""
             complaints.append(
                 Complaint(
@@ -243,7 +297,7 @@ def collect_complaints(
                     entry_number=entry.get("entry_number"),
                     entry_date_filed=entry.get("date_filed"),
                     attachment_number=doc.get("attachment_number"),
-                    description=(doc.get("description") or "").strip(),
+                    description=label,
                     court_code=code,
                     court_name=expand_court_code(code),
                     case_number=case_number,
@@ -257,6 +311,7 @@ def collect_complaints(
                     courtlistener_url=(
                         f"{COURTLISTENER_ROOT}{absolute}" if absolute else ""
                     ),
+                    labelled_complaint=labelled,
                 )
             )
 
