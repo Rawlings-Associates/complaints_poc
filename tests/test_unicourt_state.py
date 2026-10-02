@@ -401,13 +401,13 @@ class GetComplaintsBase(unittest.TestCase):
                     "fileUrl": f"https://f/{d['caseDocumentId']}.pdf"}
         client = FakeClient(routes, files or {})
         if orders is not None:  # PUT caseDocumentOrder completes at once with the doc's file
-            def serve(method, path, body=None, _orig=client._serve):
+            def serve(method, path, body=None, params=None, _orig=client._serve):
                 if method == "PUT":
                     client.calls.append((method, path, body))
                     orders.append(body["caseDocumentId"])
                     return {"status": "COMPLETE", "caseDocumentOrderCallbackId": "CB",
                             "file": {"fileUrl": f"https://f/{body['caseDocumentId']}.pdf"}}
-                return _orig(method, path, body)
+                return _orig(method, path, body, params)
             client._serve = serve
         return client
 
@@ -708,6 +708,129 @@ class ParallelTests(GetComplaintsBase):
         self.assertIn("25-1  complaint order IN_PROGRESS", err)
         self.assertIn("25-1  complaint order COMPLETE", err)
         self.assertEqual(err.count("order IN_PROGRESS"), 1)  # logged on change, not every poll
+
+
+def write_docs(tmp, rows, header="case_document_id,case_id,case_number,case_name,document_name,pages,price"):
+    path = Path(tmp) / "docs.csv"
+    path.write_text("\n".join([header] + [",".join(r) for r in rows]) + "\n")
+    return path
+
+
+@unittest.skipUnless(HAVE_PYPDF, "pypdf not installed")
+class GetDocumentsTests(GetComplaintsBase):
+    """get-documents: fetch documents chosen by id, free only, and save their text."""
+
+    def _docs_args(self, tmp, docs_csv, **kw):
+        base = dict(input_file=docs_csv, dry_run=False, text_out=str(Path(tmp) / "texts.jsonl"),
+                    pdf_dir=str(Path(tmp) / "pdfs"), yes=True, workers=3, priority="level2",
+                    token="t", workspace="w", verbose=False)
+        base.update(kw)
+        return SimpleNamespace(**base)
+
+    def _run_docs(self, client, args, ask=None):
+        err = io.StringIO()
+        patches = [mock.patch.object(cli, "_client", return_value=client), redirect_stderr(err)]
+        if ask is not None:
+            patches.append(mock.patch.object(cli, "_ask_terminal", side_effect=ask))
+        with contextlib.ExitStack() as stack:
+            for p in patches:
+                stack.enter_context(p)
+            cli.cmd_get_documents(args)
+        out = Path(args.text_out)
+        records = [json.loads(l) for l in out.read_text().splitlines()] if out.exists() else None
+        return records, err.getvalue()
+
+    def test_downloads_chosen_documents_in_input_order_with_text(self):
+        docs = {"CASE1": [doc("O1", "Other Document", repository="UNICOURT"), doc("O2", "Other Document")],
+                "CASE2": [doc("O3", "Motion - Consolidate", repository="UNICOURT")]}
+        files = {"https://f/O1.pdf": make_pdf(NY_COMPLAINT.splitlines()), "https://f/O2.pdf": make_pdf(["Exhibit A"]),
+                 "https://f/O3.pdf": make_pdf(["MOTION TO ASSIGN CASES"])}
+        orders = []
+        client = self._client(docs, files, orders=orders)
+        with tempfile.TemporaryDirectory() as tmp:
+            rows = [["O1", "CASE1", "27-CV-1", "Koskela v. Pfizer", "Other Document", "87", "0.0"],
+                    ["O3", "CASE2", "A26-1", "In re Depo", "Motion - Consolidate", "12", "0"],
+                    ["O2", "CASE1", "27-CV-1", "Koskela v. Pfizer", "Other Document", "10", "0.0"]]
+            records, err = self._run_docs(client, self._docs_args(tmp, write_docs(tmp, rows)))
+            saved = sorted(p.name for p in (Path(tmp) / "pdfs").iterdir())
+        self.assertEqual([r["case_document_id"] for r in records], ["O1", "O3", "O2"])
+        self.assertEqual({r["status"] for r in records}, {"ok"})
+        self.assertEqual((records[0]["case_number"], records[0]["case_name"], records[0]["document_name"]),
+                         ("27-CV-1", "Koskela v. Pfizer", "Other Document"))
+        self.assertIn("ROBERT SMITH and LINDA SMITH", records[0]["text"])
+        self.assertEqual(saved, ["27-CV-1_other-document_O1.pdf", "27-CV-1_other-document_O2.pdf",
+                                 "A26-1_motion-consolidate_O3.pdf"])
+        self.assertEqual(orders, ["O2"])  # only the court-held document needed a retrieval request
+        self.assertIn("[Downloading: 3/3 documents", err)
+        self.assertIn("Summary for 3 document(s) in 2 case(s): ok 3", err)
+
+    def test_documents_csv_rows_work_unchanged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "documents.csv"
+            row = {**{f: "" for f in cli.INVENTORY_FIELDS}, "case_id": "CASE1", "case_number": "27-CV-1",
+                   "case_document_id": "O1", "document_name": "Other Document", "pages": "87", "price": "0.0"}
+            cli._write_csv(path, [row, row], cli.INVENTORY_FIELDS)  # a repeated id is fetched once
+            with path.open() as fh:
+                pairs = cli.read_documents(fh)
+        self.assertEqual(len(pairs), 1)
+        case, d = pairs[0]
+        self.assertEqual((case["caseId"], case["caseNumber"], d["caseDocumentId"], d["pages"], d["price"]),
+                         ("CASE1", "27-CV-1", "O1", "87", "0.0"))
+        with self.assertRaises(SystemExit):
+            cli.read_documents(io.StringIO("case_id\nCASE1\n"))
+
+    def test_priced_documents_are_never_requested(self):
+        docs = {"CASE1": [doc("P1", "Other Document", price=2.5, repository="UNICOURT"),
+                          doc("P2", "Other Document", price=1.0, repository="UNICOURT")]}
+        client = self._client(docs)
+        with tempfile.TemporaryDirectory() as tmp:
+            rows = [["P1", "CASE1", "27-CV-1", "", "Other Document", "5", "2.5"],   # listed price: refused at once
+                    ["P2", "CASE1", "27-CV-1", "", "Other Document", "5", ""]]      # blank: live price refused
+            records, err = self._run_docs(client, self._docs_args(tmp, write_docs(tmp, rows)))
+        self.assertEqual([r["status"] for r in records], ["paid-not-supported", "paid-not-supported"])
+        self.assertEqual([c[1] for c in client.calls], ["caseDocument/P2"])  # P1 never touched the API
+        self.assertFalse(any(c[0] == "PUT" or "Download" in c[1] for c in client.calls))
+
+    def test_pdf_on_disk_is_reused_without_api_calls(self):
+        client = self._client({"CASE1": [doc("O1", "Other Document", repository="UNICOURT")]})
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "pdfs").mkdir()
+            (Path(tmp) / "pdfs" / "27-CV-1_other-document_O1.pdf").write_bytes(make_pdf(["Plaintiff Jane Doe"]))
+            rows = [["O1", "CASE1", "27-CV-1", "", "Other Document", "1", "0"]]
+            records, err = self._run_docs(client, self._docs_args(tmp, write_docs(tmp, rows)))
+        self.assertEqual(records[0]["status"], "ok")
+        self.assertIn("Plaintiff Jane Doe", records[0]["text"])
+        self.assertEqual(client.calls, [])
+        self.assertIn("reused from", err)
+        self.assertIn("PDFs downloaded: 0; reused from", err)
+
+    def test_failed_retrieval_is_recorded_and_others_continue(self):
+        docs = {"CASE1": [doc("M1", "Other Document"), doc("O2", "Other Document", repository="UNICOURT")]}
+        client = self._client(docs, {"https://f/O2.pdf": make_pdf(["Complaint"])})
+        client.routes[("PUT", "caseDocumentOrder")] = {
+            "status": "MANUAL", "caseDocumentOrderCallbackId": "CB1", "exception": {"message": "manual retrieval"}}
+        with tempfile.TemporaryDirectory() as tmp:
+            rows = [["M1", "CASE1", "27-CV-1", "", "Other Document", "87", "0"],
+                    ["O2", "CASE1", "27-CV-1", "", "Other Document", "10", "0"]]
+            records, err = self._run_docs(client, self._docs_args(tmp, write_docs(tmp, rows)))
+        self.assertEqual([r["status"] for r in records], ["download-failed", "ok"])
+        self.assertIn("ended MANUAL", err)
+        self.assertIn("download-failed 1, ok 1", err)
+
+    def test_dry_run_and_declined_fetch_nothing(self):
+        client = self._client({"CASE1": [doc("O1", "Other Document", repository="UNICOURT")]})
+        with tempfile.TemporaryDirectory() as tmp:
+            docs_csv = write_docs(tmp, [["O1", "CASE1", "27-CV-1", "Koskela", "Other Document", "87", "0"]])
+            with mock.patch.object(cli, "_client", side_effect=AssertionError("no API in a dry run")), \
+                    redirect_stderr(io.StringIO()) as err:
+                cli.cmd_get_documents(self._docs_args(tmp, docs_csv, dry_run=True))
+            self.assertIn("O1  'Other Document' (87 p., free)", err.getvalue())
+            self.assertFalse(Path(tmp, "texts.jsonl").exists())
+            for answer in ("n", None):  # None: no terminal to ask
+                records, _ = self._run_docs(client, self._docs_args(tmp, docs_csv, yes=False),
+                                            ask=lambda prompt, a=answer: a)
+                self.assertEqual(records[0]["status"], "declined")
+        self.assertEqual(client.calls, [])
 
 
 class StatusAndStopTests(unittest.TestCase):

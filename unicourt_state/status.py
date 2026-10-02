@@ -15,7 +15,7 @@ from typing import TextIO
 
 
 class Status:
-    COUNTERS = ("done", "active", "ordering", "pdfs", "texts", "failed")
+    COUNTERS = ("done", "active", "ordering", "pdfs", "reused", "texts", "failed")
 
     def __init__(
         self,
@@ -23,10 +23,12 @@ class Status:
         live: bool | None = None,
         interval: float = 1.0,
         quiet_interval: float = 30.0,
+        unit: str = "cases",
     ):
         self.stream = stream or sys.stderr
         self.live = self.stream.isatty() if live is None else live
         self.interval = interval if self.live else quiet_interval
+        self.unit = unit
         self.phase = ""
         self.total = 0
         self.counts = dict.fromkeys(self.COUNTERS, 0)
@@ -82,11 +84,12 @@ class Status:
     def line(self) -> str:
         c = self.counts
         elapsed = int(time.monotonic() - self._start)
-        parts = [f"{self.phase}: {c['done']}/{self.total} cases", f"{c['active']} active"]
+        parts = [f"{self.phase}: {c['done']}/{self.total} {self.unit}", f"{c['active']} active"]
         if c["ordering"]:
-            parts.append(f"{c['ordering']} waiting on court orders")
-        if c["pdfs"] or c["texts"]:
-            parts.append(f"{c['pdfs']} PDFs, {c['texts']} with text")
+            parts.append(f"{c['ordering']} waiting on retrievals")
+        if c["pdfs"] or c["reused"] or c["texts"]:
+            reused = f" (+{c['reused']} on disk)" if c["reused"] else ""
+            parts.append(f"{c['pdfs']} PDFs{reused}, {c['texts']} with text")
         if c["failed"]:
             parts.append(f"{c['failed']} failed")
         parts.append(f"{elapsed // 60}m{elapsed % 60:02d}s")

@@ -428,7 +428,7 @@ happens, and a status line keeps count:
   25STCV03  civil-cover-sheet order IN_PROGRESS
   25STCV03  civil-cover-sheet order COMPLETE
   25STCV03  saved pdfs/25STCV03_civil-cover-sheet_S1.pdf: text on 4 of 4 page(s)
-[Downloading: 4/6 cases | 2 active | 2 waiting on court orders | 4 PDFs, 4 with text | 0m48s]
+[Downloading: 4/6 cases | 2 active | 2 waiting on retrievals | 4 PDFs, 4 with text | 0m48s]
 ```
 
 - **In a terminal**, the status line stays at the bottom and updates every
@@ -511,6 +511,39 @@ Both output files are rewritten after every case, so an interrupted run keeps
 its progress.
 
 To print the text of a PDF you already have: `unicourt extract file.pdf`.
+
+### Chosen documents (`get-documents`)
+
+`get-complaints` finds documents by name, and some courts name them
+generically. Hennepin County, Minnesota, files most complaints as "Other
+Document", for example, and a consolidation docket holds motions and orders
+rather than complaints. For these, choose the documents yourself (or let an
+agent choose) and fetch them by id:
+
+```console
+$ unicourt get-complaints -i cases.csv --dry-run          # documents.csv lists every document
+                                                          # copy the rows you want to picks.csv
+$ unicourt get-documents -i picks.csv --dry-run           # what would be fetched; no API calls
+$ unicourt get-documents -i picks.csv                     # free documents only -> texts_documents.jsonl
+```
+
+- **Input:** any CSV with a `case_document_id` column. Rows of
+  `documents.csv` work unchanged, so their case details, document name, pages
+  and price come along.
+- **Free only:** a row whose listed price is not 0 is refused without an API
+  call. Every other document is re-read from UniCourt just before it is
+  requested, and refused unless it is free at that moment.
+- **Confirmation:** one prompt per case, as with `get-complaints`; `--yes`
+  skips them.
+- **Parallel:** `--workers` documents at a time (default 4). Documents held at
+  the court need a retrieval request, which can take minutes; the status line
+  counts them as "waiting on retrievals".
+- **Resumable:** PDFs are saved as `{caseNumber}_{document-name}_{documentId}.pdf`
+  in `--pdf-dir`, and a PDF already there is reused without an API call, so a
+  stopped run can simply be repeated.
+- **Output:** `--text-out` (default `texts_documents.jsonl`) has one line per
+  chosen document, in input order, with the same fields and statuses as the
+  `get-complaints` text file, plus `declined` and `interrupted`.
 
 ### Reference material
 

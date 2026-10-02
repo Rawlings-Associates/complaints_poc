@@ -28,6 +28,7 @@ import getpass
 import io
 import json
 import os
+import re
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -230,6 +231,28 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--yes", action="store_true", help="download without asking (use after testing)")
     p.add_argument("--workers", type=int, default=4,
                    help=f"cases processed in parallel, 1-{MAX_WORKERS} (default: %(default)s)")
+    p.add_argument("--priority", choices=("level1", "level2", "level5"), default="level2",
+                   help="order priority; timeouts 5 min / 30 min / 24 h (default: %(default)s)")
+    _add_auth(p)
+
+    p = sub.add_parser(
+        "get-documents",
+        help="download chosen documents by case_document_id (e.g. rows picked from documents.csv) "
+        "and save their text",
+    )
+    p.add_argument("-i", "--input-file", type=Path, metavar="DOCS.csv",
+                   help="documents to fetch, with a case_document_id column (documents.csv rows "
+                   "work as they are); default: read CSV from stdin (a pipe)")
+    p.add_argument("--dry-run", action="store_true",
+                   help="show what would be fetched; no API calls, nothing downloaded")
+    p.add_argument("--text-out", default="texts_documents.jsonl",
+                   help="one JSON line per document with its full text, or why it has none "
+                   "(default: %(default)s)")
+    p.add_argument("--pdf-dir", default="pdfs",
+                   help="where PDFs are saved; a PDF already there is reused (default: %(default)s)")
+    p.add_argument("--yes", action="store_true", help="download without asking (use after testing)")
+    p.add_argument("--workers", type=int, default=4,
+                   help=f"documents fetched in parallel, 1-{MAX_WORKERS} (default: %(default)s)")
     p.add_argument("--priority", choices=("level1", "level2", "level5"), default="level2",
                    help="order priority; timeouts 5 min / 30 min / 24 h (default: %(default)s)")
     _add_auth(p)
@@ -667,6 +690,209 @@ def cmd_get_complaints(args) -> int:
     return 0
 
 
+def read_documents(fh: TextIO, source: str = "input") -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    """Load chosen documents as (case, document) pairs. Only case_document_id is required.
+
+    Rows of ``documents.csv`` work unchanged: their case columns name the case and
+    their price, pages and name columns describe the document.
+    """
+    reader = csv.DictReader(fh)
+    fields = {f.strip().lower(): f for f in reader.fieldnames or []}
+    id_col = fields.get("case_document_id") or fields.get("casedocumentid")
+    if not id_col:
+        raise SystemExit(f"{source} needs a case_document_id column (as in documents.csv)")
+
+    def col(row, name):
+        key = fields.get(name)
+        return (row.get(key) or "").strip() if key else ""
+
+    pairs, seen = [], set()
+    for row in reader:
+        doc_id = (row.get(id_col) or "").strip()
+        if not doc_id or doc_id in seen:
+            continue
+        seen.add(doc_id)
+        case = {
+            "caseId": col(row, "case_id"),
+            "caseNumber": col(row, "case_number"),
+            "caseName": col(row, "case_name"),
+            "court": {"name": col(row, "court"), "type": col(row, "court_type")},
+            "courtLocation": {"stateName": col(row, "state")},
+            "filedDate": col(row, "filed_date"),
+        }
+        price = col(row, "price")
+        doc = {
+            "caseDocumentId": doc_id,
+            "name": col(row, "document_name"),
+            "description": col(row, "document_description"),
+            "documentFiledDate": col(row, "document_filed_date"),
+            "pages": col(row, "pages"),
+            "price": price if price else None,
+        }
+        pairs.append((case, doc))
+    return pairs
+
+
+def _load_documents(args) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    if args.input_file and str(args.input_file) != "-":
+        with args.input_file.open(newline="", encoding="utf-8-sig") as fh:
+            return read_documents(fh, str(args.input_file))
+    if sys.stdin.isatty():
+        raise SystemExit("Give the documents with --input-file DOCS.csv (rows of documents.csv), "
+                         "or pipe them in")
+    return read_documents(io.StringIO(sys.stdin.read()), "stdin")
+
+
+def _document_filename(case: dict[str, Any], doc: dict[str, Any]) -> str:
+    case_no = re.sub(r"[^A-Za-z0-9._-]+", "_", case.get("caseNumber") or case.get("caseId") or "case")
+    slug = re.sub(r"[^a-z0-9]+", "-", (doc.get("name") or "document").lower()).strip("-")[:40] or "document"
+    return f"{case_no}_{slug}_{doc['caseDocumentId']}.pdf"
+
+
+def fetch_document(client, case, doc, args, status: Status, stop: threading.Event) -> dict[str, Any]:
+    """Download one chosen document and read its text (runs in a worker).
+
+    Only free documents are fetched. A listed price other than 0 is refused
+    without an API call; a blank one is left to ``obtain_file_url``, which
+    re-reads the document and refuses anything that is not free right now.
+    A PDF already in ``--pdf-dir`` is reused, so a stopped run can be repeated.
+    """
+    cand = docs_mod.Candidate("selected", 1.0, doc)
+    tag = f"{_tag(case)} {doc['caseDocumentId']}"
+    path = Path(args.pdf_dir) / _document_filename(case, doc)
+    if stop.is_set():
+        return _text_record(case, cand, "interrupted")
+    if path.exists() and path.stat().st_size:
+        status.log(f"  {tag}  already on disk: {path}")
+        status.add(reused=1)
+    else:
+        if doc.get("price") is not None and docs_mod.price_of(doc) != 0:
+            status.log(f"  {tag}  listed price {doc['price']!r}: {docs_mod.PAID_NOT_SUPPORTED}")
+            return _text_record(case, cand, "paid-not-supported")
+        status.log(f"  {tag}  fetching '{cand.label}'")
+        waiting = {"on": False, "last": None}
+
+        def on_order(state):
+            if state != waiting["last"]:
+                status.log(f"  {tag}  retrieval {state}")
+                waiting["last"] = state
+            if state in ("IN_PROGRESS", "DELAYED") and not waiting["on"]:
+                waiting["on"] = True
+                status.add(ordering=1)
+
+        try:
+            url = docs_mod.obtain_file_url(client, {**doc, "price": doc.get("price") or 0},
+                                           priority=args.priority, on_status=on_order, stop=stop)
+            docs_mod.download(client, url, path.parent, path.name)
+        except docs_mod.PaidDownloadNotSupported as exc:
+            status.log(f"  {tag}  {exc}")
+            return _text_record(case, cand, "paid-not-supported")
+        except (docs_mod.DocumentUnavailable, UniCourtError, OSError) as exc:
+            status.log(f"  {tag}  could not fetch: {exc}")
+            status.add(failed=1)
+            return _text_record(case, cand, "download-failed")
+        finally:
+            if waiting["on"]:
+                status.add(ordering=-1)
+        status.add(pdfs=1)
+    try:
+        pages = read_pages(path)
+    except Exception as exc:  # a damaged PDF must not stop the other documents
+        status.log(f"  {tag}  could not read the text of {path}: {exc}")
+        return _text_record(case, cand, "text-extraction-failed", path)
+    with_text = sum(1 for p in pages if p)
+    if not with_text:
+        status.log(f"  {tag}  saved {path} (no text layer: scanned?)")
+        return _text_record(case, cand, "no-text-layer", path, pages)
+    status.add(texts=1)
+    status.log(f"  {tag}  saved {path}: text on {with_text} of {len(pages)} page(s)")
+    return _text_record(case, cand, "ok", path, pages)
+
+
+def cmd_get_documents(args) -> int:
+    if not 1 <= args.workers <= MAX_WORKERS:
+        raise SystemExit(f"--workers must be between 1 and {MAX_WORKERS}")
+    pairs = _load_documents(args)
+    if not pairs:
+        raise SystemExit("no documents to fetch")
+    by_case: dict[str, list[int]] = {}
+    for i, (case, _) in enumerate(pairs):
+        by_case.setdefault(case["caseId"] or case["caseNumber"], []).append(i)
+
+    def describe(doc):
+        price = docs_mod.price_of(doc)
+        cost = "price?" if doc.get("price") is None else "free" if price == 0 else f"${price:,.2f}"
+        pages = f"{doc['pages']} p." if doc.get("pages") else "? p."
+        return f"'{doc.get('name') or doc['caseDocumentId']}' ({pages}, {cost})"
+
+    _err(f"{len(pairs)} document(s) in {len(by_case)} case(s)"
+         + (" [dry run: no API calls, nothing downloaded]" if args.dry_run else ""))
+    for indices in by_case.values():
+        case = pairs[indices[0]][0]
+        _err(f"{_tag(case)}  {case.get('caseName') or ''}")
+        for i in indices:
+            doc = pairs[i][1]
+            on_disk = (Path(args.pdf_dir) / _document_filename(case, doc)).exists()
+            _err(f"    {doc['caseDocumentId']}  {describe(doc)}" + ("  [on disk]" if on_disk else ""))
+    if args.dry_run:
+        return 0
+
+    # Confirm per case, before anything is requested.
+    confirm = Confirmer(args.yes)
+    records: dict[int, dict[str, Any]] = {}
+    approved: list[int] = []
+    for indices in by_case.values():
+        case = pairs[indices[0]][0]
+        listing = ", ".join(describe(pairs[i][1]) for i in indices)
+        if not confirm.quit and confirm(f"{_tag(case)} {case.get('caseName') or ''}: download {listing}?"):
+            approved.extend(indices)
+        else:
+            for i in indices:
+                records[i] = _text_record(pairs[i][0], docs_mod.Candidate("selected", 1.0, pairs[i][1]),
+                                          "declined")
+
+    text_out = Path(args.text_out)
+    client = _client(args) if approved else None
+    status, stop = Status(unit="documents"), threading.Event()
+
+    def checkpoint():
+        _write_jsonl(text_out, (records[i] for i in sorted(records)))
+
+    def fetch_one(_, i):
+        status.add(active=1)
+        try:
+            return i, fetch_document(client, *pairs[i], args, status, stop)
+        finally:
+            status.add(active=-1, done=1)
+
+    def collect(result):
+        records[result[0]] = result[1]
+        checkpoint()
+
+    checkpoint()
+    if approved:
+        status.start("Downloading", len(approved))
+        try:
+            run_parallel(sorted(approved), fetch_one, args.workers, status, stop, collect)
+        finally:
+            status.finish()
+            for i in approved:  # cancelled by Ctrl-C before they started
+                records.setdefault(i, _text_record(pairs[i][0], docs_mod.Candidate("selected", 1.0, pairs[i][1]),
+                                                   "interrupted"))
+            checkpoint()
+
+    counts: dict[str, int] = {}
+    for r in records.values():
+        counts[r["status"]] = counts.get(r["status"], 0) + 1
+    _err("")
+    _err(f"Summary for {len(pairs)} document(s) in {len(by_case)} case(s): "
+         + ", ".join(f"{k} {v}" for k, v in sorted(counts.items())))
+    _err(f"  PDFs downloaded: {status.counts['pdfs']}; reused from {args.pdf_dir}: "
+         f"{status.counts['reused']}; with text: {counts.get('ok', 0)}")
+    _err(f"  Wrote {text_out}" + (f"; {_api_usage(client)}." if client else "; no API requests."))
+    return 0
+
+
 def cmd_extract(args) -> int:
     pages = read_pages(args.pdf)
     print(format_pages(pages))
@@ -679,7 +905,8 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     handler = {
         "token": cmd_token, "courts": cmd_courts, "search": cmd_search,
-        "get-complaints": cmd_get_complaints, "extract": cmd_extract,
+        "get-complaints": cmd_get_complaints, "get-documents": cmd_get_documents,
+        "extract": cmd_extract,
     }[args.command]
     try:
         return handler(args)
