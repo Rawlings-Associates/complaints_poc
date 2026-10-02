@@ -19,15 +19,16 @@ INVENTORY_FIELDS = CASE_FIELDS + [
     "case_document_id", "document_name", "document_description", "document_filed_date",
     "pages", "price", "repository", "availability", "preview_available",
     "matched_type", "match_score", "action", "result", "pdf_path",
-    "plaintiffs_found",
+    "text_pages",
 ]
 
 # The planned action for a document.
 ACTIONS = {
     "download": "free; downloaded",
-    "fallback": "free; downloaded only if the documents before it yield no plaintiffs",
+    "fallback": "free; downloaded only if the documents before it give no text "
+                "(failed download, or a scan with no text layer)",
     "buy": "priced; within --budget (planning only: paid downloads are not supported)",
-    "buy-fallback": "priced; needed only if the documents before it yield no plaintiffs (planning only)",
+    "buy-fallback": "priced; needed only if the documents before it give no text (planning only)",
     "over-budget": "priced; would exceed --budget",
     "paid-skip": "priced; not downloaded (paid downloads are not supported)",
     "unknown-price": "no price given; never fetched",
@@ -87,7 +88,7 @@ def document_row(case: dict[str, Any], doc: dict[str, Any]) -> dict[str, Any]:
         "availability": doc.get("availabilityStatusAtCourtSource") or "",
         "preview_available": doc.get("isPreviewAvailable", ""),
         "matched_type": "", "match_score": "", "action": "", "result": "",
-        "pdf_path": "", "plaintiffs_found": "",
+        "pdf_path": "", "text_pages": "",
     }
 
 
@@ -167,7 +168,7 @@ def summarize(
     dry_run: bool,
     include_paid: bool,
     planned: Budget,
-    plaintiff_rows: list[dict[str, Any]] | None = None,
+    text_records: list[dict[str, Any]] | None = None,
 ) -> str:
     note = " (dry run: nothing was ordered or downloaded)" if dry_run else ""
     docs_listed = sum(1 for p in plans for r in p.rows if r["case_document_id"])
@@ -212,17 +213,18 @@ def summarize(
     else:
         lines.append("  Paid documents are not downloaded (downloading them is not supported).")
 
-    if plaintiff_rows is not None:
+    if text_records is not None:
         downloaded = sum(1 for p in plans for r in p.rows if r["result"] == "downloaded")
-        ok = [r for r in plaintiff_rows if r["status"] == "ok"]
-        lines.append(f"  PDFs downloaded: {downloaded}; plaintiffs found: {len(ok)} "
-                     f"in {len({r['case_id'] for r in ok})} case(s)")
+        ok = [r for r in text_records if r["status"] == "ok"]
+        with_text = {r["case_id"] for r in ok}
+        lines.append(f"  PDFs downloaded: {downloaded}; with text: {len(ok)} "
+                     f"in {len(with_text)} case(s)")
         other: dict[str, int] = {}
-        for r in plaintiff_rows:
-            if r["status"] != "ok":
+        for r in text_records:
+            if r["status"] != "ok" and r["case_id"] not in with_text:
                 other[r["status"]] = other.get(r["status"], 0) + 1
         if other:
-            lines.append("  Cases without plaintiffs: "
+            lines.append("  Cases without text: "
                          + ", ".join(f"{k} {v}" for k, v in sorted(other.items())))
     lines.append("  Prices are what UniCourt reports for each document at the court/source; "
                  "UniCourt's own charges, if any, are not included.")

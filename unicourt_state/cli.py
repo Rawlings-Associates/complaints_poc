@@ -7,6 +7,7 @@ Workflow::
     # edit cases.csv down to the cases you care about
     unicourt get-complaints --input-file cases.csv --dry-run --out documents.csv
     unicourt get-complaints --input-file cases.csv            # free documents only
+    # texts.jsonl now holds each document's text, for an agent to read the parties from
     unicourt get-complaints --input-file cases.csv --dry-run --include-paid --budget 25
 
     # or straight from a search:
@@ -25,6 +26,7 @@ import argparse
 import csv
 import getpass
 import io
+import json
 import os
 import sys
 import threading
@@ -37,17 +39,12 @@ from . import documents as docs_mod
 from . import credentials as creds
 from .credentials import mask
 from .client import API_ROOT, UniCourtClient, UniCourtError
-from .plaintiffs import NoTextLayer, extract_text, parse_plaintiffs
+from .pdftext import format_pages, read_pages
 from .plan import CASE_FIELDS, INVENTORY_FIELDS, Budget, CasePlan, case_record, plan_case, summarize
 from .search import build_query, find_courts, search_cases
 from .status import Status
 
 MAX_WORKERS = 16
-
-PLAINTIFF_FIELDS = CASE_FIELDS + [
-    "document_type", "document_name", "case_document_id", "price",
-    "pdf_path", "plaintiff", "method", "status",
-]
 
 
 def _err(msg: str) -> None:
@@ -158,7 +155,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="unicourt",
         description="Find cases by party in a state, county, court type (state or federal) "
-        "or court, then price or download their cover sheets / complaints and list the plaintiffs.",
+        "or court, then price or download their cover sheets / complaints and save their text "
+        "for an agent to read.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -205,7 +203,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser(
         "get-complaints",
         help="for each listed case, pick the relevant documents; price them (--dry-run) "
-        "or download them and list the plaintiffs",
+        "or download them and save their text",
     )
     p.add_argument("-i", "--input-file", type=Path, metavar="CASES.csv",
                    help="case list with a case_id column; default: read CSV from stdin (a pipe)")
@@ -225,8 +223,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--out", default="documents.csv",
                    help="every document of every case with price, match and action "
                    "(default: %(default)s)")
-    p.add_argument("--plaintiffs-out", default="plaintiffs.csv",
-                   help="plaintiffs found, written when not a dry run (default: %(default)s)")
+    p.add_argument("--text-out", default="texts.jsonl",
+                   help="one JSON line per case document with its full text, or the reason "
+                   "a case has none; written when not a dry run (default: %(default)s)")
     p.add_argument("--pdf-dir", default="pdfs", help="where PDFs are saved (default: %(default)s)")
     p.add_argument("--yes", action="store_true", help="download without asking (use after testing)")
     p.add_argument("--workers", type=int, default=4,
@@ -235,9 +234,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="order priority; timeouts 5 min / 30 min / 24 h (default: %(default)s)")
     _add_auth(p)
 
-    p = sub.add_parser("extract", help="parse plaintiffs from a PDF already on disk")
+    p = sub.add_parser("extract", help="print the text of a PDF already on disk, page by page")
     p.add_argument("pdf", type=Path)
-    p.add_argument("--doc-type", choices=list(docs_mod.DOC_TYPES), default="complaint")
     return parser
 
 
@@ -431,15 +429,30 @@ def _load_cases(args) -> list[dict[str, Any]]:
     return read_cases(io.StringIO(sys.stdin.read()), "stdin")
 
 
-def _plaintiff_row(case, cand=None, path="", plaintiff="", method="", status=""):
+def _text_record(case, cand=None, status="", path="", pages=None):
+    """One line of the text JSONL: a document's text, or why the case has none.
+
+    ``status`` is ``ok`` (text extracted), ``no-text-layer`` (downloaded, but a
+    scan), ``text-extraction-failed``, or a reason nothing was downloaded.
+    """
+    pages = pages or []
     return {
         **case_record(case),
         "document_type": cand.doc_type if cand else "",
         "document_name": cand.label if cand else "",
         "case_document_id": cand.doc.get("caseDocumentId", "") if cand else "",
         "price": cand.doc.get("price", "") if cand else "",
-        "pdf_path": str(path), "plaintiff": plaintiff, "method": method, "status": status,
+        "pdf_path": str(path), "status": status,
+        "page_count": len(pages), "pages_with_text": sum(1 for p in pages if p),
+        "text": format_pages(pages) if pages else "",
     }
+
+
+def _write_jsonl(path: Path, records: Iterable[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as fh:
+        for record in records:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
 def _tag(case: dict[str, Any]) -> str:
@@ -469,9 +482,14 @@ def run_parallel(items, work, workers: int, status: Status, stop: threading.Even
 
 
 def fetch_case(client, plan: CasePlan, args, status: Status, stop: threading.Event) -> list[dict[str, Any]]:
-    """Try the planned free documents in order until one yields plaintiffs (runs in a worker)."""
+    """Try the planned free documents in order until one gives text (runs in a worker).
+
+    Returns a text record for every document downloaded (a scan included, so
+    the agent sees it was tried), or one record saying why there is none.
+    """
     case, tag = plan.case, _tag(plan.case)
     outcome = ""
+    records: list[dict[str, Any]] = []
     for cand, row in plan.tries:
         if stop.is_set():
             outcome = outcome or "interrupted"
@@ -508,28 +526,32 @@ def fetch_case(client, plan: CasePlan, args, status: Status, stop: threading.Eve
         row["result"], row["pdf_path"] = "downloaded", str(path)
         status.add(pdfs=1)
         try:
-            names, method = parse_plaintiffs(extract_text(path), cand.doc_type)
-        except NoTextLayer:
-            status.log(f"  {tag}  saved {path} (no text layer: scanned?)")
-            row["plaintiffs_found"], outcome = "no text layer", "no-text-layer"
+            pages = read_pages(path)
+        except Exception as exc:  # a damaged PDF must not stop the other cases
+            status.log(f"  {tag}  saved {path}, but could not read its text: {exc}")
+            records.append(_text_record(case, cand, "text-extraction-failed", path))
+            outcome = "text-extraction-failed"
             continue
-        row["plaintiffs_found"] = len(names)
-        if names:
-            status.add(plaintiffs=len(names))
-            status.log(f"  {tag}  saved {path}: {len(names)} plaintiff(s)")
-            return [_plaintiff_row(case, cand, path, n, method, "ok") for n in names]
-        status.log(f"  {tag}  saved {path}: no plaintiff names found")
-        outcome = "no-plaintiffs-found"
-    return [_plaintiff_row(case, plan.tries[-1][0], status=outcome or "not-attempted")]
+        with_text = sum(1 for p in pages if p)
+        row["text_pages"] = with_text
+        if with_text:
+            status.add(texts=1)
+            status.log(f"  {tag}  saved {path}: text on {with_text} of {len(pages)} page(s)")
+            records.append(_text_record(case, cand, "ok", path, pages))
+            return records
+        status.log(f"  {tag}  saved {path} (no text layer: scanned?)")
+        records.append(_text_record(case, cand, "no-text-layer", path, pages))
+        outcome = "no-text-layer"
+    return records or [_text_record(case, plan.tries[-1][0], outcome or "not-attempted")]
 
 
-def _gap_rows(plan: CasePlan, declined: bool) -> list[dict[str, Any]]:
-    """The plaintiffs-CSV row for a case that is not fetched."""
+def _gap_records(plan: CasePlan, declined: bool) -> list[dict[str, Any]]:
+    """The text record for a case that is not fetched."""
     if not any(plan.matches.values()):
-        return [_plaintiff_row(plan.case, status="no-matching-document")]
+        return [_text_record(plan.case, status="no-matching-document")]
     if not plan.tries:
-        return [_plaintiff_row(plan.case, status="no-free-document")]
-    return [_plaintiff_row(plan.case, plan.tries[0][0], status="declined" if declined else "not-attempted")]
+        return [_text_record(plan.case, status="no-free-document")]
+    return [_text_record(plan.case, plan.tries[0][0], "declined" if declined else "not-attempted")]
 
 
 def cmd_get_complaints(args) -> int:
@@ -550,7 +572,7 @@ def cmd_get_complaints(args) -> int:
 
     client = _client(args)
     status, stop = Status(), threading.Event()
-    out, plaintiffs_out = Path(args.out), Path(args.plaintiffs_out)
+    out, text_out = Path(args.out), Path(args.text_out)
     mode = "dry run" if args.dry_run else "free documents only"
     _err(f"{len(cases)} case(s) [{mode}], {args.workers} worker(s)")
 
@@ -590,7 +612,7 @@ def cmd_get_complaints(args) -> int:
                 _err(f"    {row['matched_type']:<18} {row['action']:<13} {price:<9} {row['document_name']}")
     _write_csv(out, (r for p in plans for r in p.rows), INVENTORY_FIELDS)
 
-    plaintiff_rows: list[dict[str, Any]] = []
+    text_records: list[dict[str, Any]] = []
     if not args.dry_run:
         # 3. Confirm per case, here in the main thread, before any download starts.
         confirm = Confirmer(args.yes)
@@ -606,14 +628,13 @@ def cmd_get_complaints(args) -> int:
                     continue
                 for _, row in plan.tries:
                     row["result"] = "declined"
-                rows_by_case[i] = _gap_rows(plan, declined=True)
+                rows_by_case[i] = _gap_records(plan, declined=True)
             else:
-                rows_by_case[i] = _gap_rows(plan, declined=False)
+                rows_by_case[i] = _gap_records(plan, declined=False)
 
         # 4. Download the approved cases in parallel.
         def checkpoint():
-            ordered = [r for i in sorted(rows_by_case) for r in rows_by_case[i]]
-            _write_csv(plaintiffs_out, ordered, PLAINTIFF_FIELDS)
+            _write_jsonl(text_out, (r for i in sorted(rows_by_case) for r in rows_by_case[i]))
             _write_csv(out, (r for p in plans for r in p.rows), INVENTORY_FIELDS)
 
         def fetch_one(_, item):
@@ -636,22 +657,22 @@ def cmd_get_complaints(args) -> int:
             finally:
                 status.finish()
                 checkpoint()
-        plaintiff_rows = [r for i in sorted(rows_by_case) for r in rows_by_case[i]]
+        text_records = [r for i in sorted(rows_by_case) for r in rows_by_case[i]]
 
     _err("")
     _err(summarize(plans, order, args.dry_run, args.include_paid, planned,
-                   None if args.dry_run else plaintiff_rows))
-    written = f"{out}" + ("" if args.dry_run else f" and {plaintiffs_out}")
+                   None if args.dry_run else text_records))
+    written = f"{out}" + ("" if args.dry_run else f" and {text_out}")
     _err(f"  Wrote {written}; {_api_usage(client)}.")
     return 0
 
 
 def cmd_extract(args) -> int:
-    names, method = parse_plaintiffs(extract_text(args.pdf), args.doc_type)
-    for name in names:
-        print(name)
-    _err(f"{len(names)} plaintiff(s) via {method or 'nothing'}")
-    return 0 if names else 1
+    pages = read_pages(args.pdf)
+    print(format_pages(pages))
+    with_text = sum(1 for p in pages if p)
+    _err(f"text on {with_text} of {len(pages)} page(s)")
+    return 0 if with_text else 1
 
 
 def main(argv: list[str] | None = None) -> int:

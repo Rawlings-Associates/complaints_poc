@@ -31,14 +31,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from unicourt_state import cli, documents  # noqa: E402
 from unicourt_state import client as client_mod  # noqa: E402
 from unicourt_state import credentials as credentials_mod  # noqa: E402
+from unicourt_state import pdftext  # noqa: E402
 from unicourt_state import search as search_mod  # noqa: E402
 from unicourt_state.status import Status  # noqa: E402
-from unicourt_state.plaintiffs import (  # noqa: E402
-    parse_plaintiffs,
-    plaintiffs_from_caption,
-    plaintiffs_from_cover_sheet,
-    split_names,
-)
 from unicourt_state.search import build_query  # noqa: E402
 
 try:
@@ -176,7 +171,7 @@ class DocumentChoiceTests(unittest.TestCase):
         # already in UniCourt's store but still priced: not free
         self.assertFalse(documents.is_free(doc("D", "x", price=0.2, repository="UNICOURT")))
 
-    def _attempts(self, docs, include_paid=False, order=documents.DEFAULT_ORDER):
+    def _attempts(self, docs, include_paid=False, order=("civil-cover-sheet", "complaint")):
         matches = documents.match_all(docs, order)
         return [c.doc["caseDocumentId"] for c in documents.attempts(matches, order, include_paid)]
 
@@ -264,23 +259,7 @@ class DocumentChoiceTests(unittest.TestCase):
             documents.obtain_file_url(client, doc("D", "Complaint"))
 
 
-# -- plaintiff parsing ----------------------------------------------------------
-
-CA_COMPLAINT = """\
-1 JOHN LAWYER (SBN 123456)
-2 LAWYER LLP
-3 100 Main Street, Suite 200
-4 Attorneys for Plaintiffs
-5
-SUPERIOR COURT OF THE STATE OF CALIFORNIA
-FOR THE COUNTY OF LOS ANGELES
-6 JANE DOE, an individual; and MARIA
-7 GARCIA, individually and as successor in interest to Jose Garcia,
-8 Plaintiffs, Case No.: 25STCV01234
-9 v. COMPLAINT FOR DAMAGES
-10 PFIZER INC., a Delaware corporation; and DOES 1 through 50,
-11 Defendants.
-"""
+# -- PDF text ----------------------------------------------------------------------
 
 NY_COMPLAINT = """\
 SUPREME COURT OF THE STATE OF NEW YORK
@@ -290,13 +269,6 @@ Plaintiffs,
 -against-
 ACME CORP.,
 Defendant.
-"""
-
-TX_PETITION = """\
-CAUSE NO. 2025-12345
-IN THE DISTRICT COURT OF HARRIS COUNTY, TEXAS
-ANGELA BROWN, Plaintiff, v. ACME CORP., Defendant
-PLAINTIFF'S ORIGINAL PETITION
 """
 
 TX_COVER_SHEET = """\
@@ -309,57 +281,52 @@ Defendant(s)/Respondent(s):
 Acme Corp.
 """
 
-FL_COVER_SHEET = """\
-FORM 1.997. CIVIL COVER SHEET
-IN THE CIRCUIT COURT OF THE ELEVENTH JUDICIAL CIRCUIT
-IN AND FOR MIAMI-DADE COUNTY, FLORIDA
-Plaintiff
-Carlos Rivera
-Ana Rivera
-vs.
-Defendant
-Acme Corp.
-"""
 
-CA_COVER_SHEET = """\
-CM-010
-CASE NAME: Jane Doe, et al. v. Pfizer Inc.
-CIVIL CASE COVER SHEET
-"""
+class FakePage:
+    def __init__(self, layout=None, plain=""):
+        self.layout, self.plain = layout, plain
+
+    def extract_text(self, extraction_mode="plain"):
+        if extraction_mode == "layout":
+            if self.layout is None:
+                raise ValueError("layout mode failed")
+            return self.layout
+        return self.plain
 
 
-class PlaintiffParsingTests(unittest.TestCase):
-    def test_california_caption(self):
-        self.assertEqual(plaintiffs_from_caption(CA_COMPLAINT), ["JANE DOE", "MARIA GARCIA"])
+class PdfTextTests(unittest.TestCase):
+    def test_layout_gaps_are_shortened_and_blank_lines_dropped(self):
+        page = FakePage("   PLAINTIFF FIRST  PLAINTIFF LAST          STATE\n\n"
+                        "Adriane          Williams                   Minnesota   \n")
+        self.assertEqual(pdftext._page_text(page),
+                         "PLAINTIFF FIRST  PLAINTIFF LAST   STATE\nAdriane   Williams   Minnesota")
 
-    def test_new_york_caption(self):
-        self.assertEqual(plaintiffs_from_caption(NY_COMPLAINT), ["ROBERT SMITH", "LINDA SMITH"])
+    def test_plain_mode_is_used_when_layout_mode_fails(self):
+        self.assertEqual(pdftext._page_text(FakePage(None, "Jane Doe\n")), "Jane Doe")
 
-    def test_inline_caption(self):
-        self.assertEqual(plaintiffs_from_caption(TX_PETITION), ["ANGELA BROWN"])
+    def test_pages_are_numbered_and_scans_marked(self):
+        text = pdftext.format_pages(["Plaintiff\nJane Doe", ""])
+        self.assertEqual(text, "=== Page 1 of 2 ===\nPlaintiff\nJane Doe\n\n"
+                               f"=== Page 2 of 2 ===\n{pdftext.NO_TEXT}")
 
-    def test_texas_cover_sheet(self):
-        self.assertEqual(plaintiffs_from_cover_sheet(TX_COVER_SHEET), ["Angela Brown"])
-
-    def test_florida_cover_sheet(self):
-        self.assertEqual(plaintiffs_from_cover_sheet(FL_COVER_SHEET), ["Carlos Rivera", "Ana Rivera"])
-
-    def test_cover_sheet_case_name_fallback(self):
-        self.assertEqual(plaintiffs_from_cover_sheet(CA_COVER_SHEET), ["Jane Doe"])
-
-    def test_cover_sheet_falls_back_to_caption(self):
-        names, method = parse_plaintiffs(NY_COMPLAINT, "civil-cover-sheet")
-        self.assertEqual((names, method), (["ROBERT SMITH", "LINDA SMITH"], "caption"))
-
-    def test_nothing_found(self):
-        self.assertEqual(parse_plaintiffs("Exhibit A\nInvoice total 42", "complaint"), ([], ""))
-
-    def test_split_names_drops_descriptors(self):
-        self.assertEqual(
-            split_names("JOHN ROE, a minor, by and through his guardian ad litem MARY ROE; "
-                        "PAT LEE, an individual"),
-            ["JOHN ROE", "PAT LEE"],
-        )
+    @unittest.skipUnless(HAVE_PYPDF, "pypdf not installed")
+    def test_read_pages_and_extract_command(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pdf = Path(tmp) / "cover.pdf"
+            pdf.write_bytes(make_pdf(TX_COVER_SHEET.splitlines()))
+            self.assertIn("Angela Brown", pdftext.read_pages(pdf)[0])
+            out, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                code = cli.main(["extract", str(pdf)])
+            scan = Path(tmp) / "scan.pdf"
+            scan.write_bytes(make_pdf([]))
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                scan_code = cli.main(["extract", str(scan)])
+        self.assertEqual(code, 0)
+        self.assertTrue(out.getvalue().startswith("=== Page 1 of 1 ===\n"))
+        self.assertIn("Defendant(s)/Respondent(s):", out.getvalue())
+        self.assertIn("text on 1 of 1 page(s)", err.getvalue())
+        self.assertEqual(scan_code, 1)
 
 
 # -- end-to-end run with a fake API ------------------------------------------------
@@ -448,7 +415,7 @@ class GetComplaintsBase(unittest.TestCase):
         base = dict(input_file=cases_csv, dry_run=False, include_paid=False, budget=None,
                     doc_types="civil-cover-sheet,complaint", threshold=0.8, limit=0,
                     out=str(Path(tmp) / "documents.csv"),
-                    plaintiffs_out=str(Path(tmp) / "plaintiffs.csv"),
+                    text_out=str(Path(tmp) / "texts.jsonl"),
                     pdf_dir=str(Path(tmp) / "pdfs"), yes=True, priority="level2",
                     workers=3, token="t", workspace="w", verbose=False)
         base.update(kw)
@@ -469,7 +436,12 @@ class GetComplaintsBase(unittest.TestCase):
                 return None
             with open(path) as fh:
                 return list(csv.DictReader(fh))
-        return read(args.out), read(args.plaintiffs_out), err.getvalue()
+
+        def read_jsonl(path):
+            if not Path(path).exists():
+                return None
+            return [json.loads(line) for line in Path(path).read_text().splitlines()]
+        return read(args.out), read_jsonl(args.text_out), err.getvalue()
 
 
 class CaseListTests(unittest.TestCase):
@@ -526,6 +498,11 @@ class OptionTests(unittest.TestCase):
                 cli.cmd_get_complaints(cli.build_parser().parse_args(
                     ["get-complaints", "-i", "x.csv", *extra]))
 
+    def test_cover_sheet_is_the_only_default_document_type(self):
+        args = cli.build_parser().parse_args(["get-complaints", "-i", "x.csv"])
+        self.assertEqual(args.doc_types, "civil-cover-sheet")
+        self.assertEqual(args.text_out, "texts.jsonl")
+
     def test_budget_parsing(self):
         args = cli.build_parser().parse_args(
             ["get-complaints", "-i", "x.csv", "--include-paid", "--budget", "$1,250.50"])
@@ -549,11 +526,11 @@ class DryRunTests(GetComplaintsBase):
         client = self._client(self.DOCS)
         with tempfile.TemporaryDirectory() as tmp:
             cases = write_cases(tmp, [[c, "", "", "", ""] for c in self.DOCS])
-            inventory, plaintiffs, err = self._run(client, self._args(tmp, cases, dry_run=True, **kw))
-        return client, inventory, plaintiffs, err
+            inventory, texts, err = self._run(client, self._args(tmp, cases, dry_run=True, **kw))
+        return client, inventory, texts, err
 
     def test_inventory_lists_every_document_with_price_and_action(self):
-        client, inventory, plaintiffs, err = self._dry()
+        client, inventory, texts, err = self._dry()
         rows = {(r["case_id"], r["case_document_id"]): r for r in inventory}
         self.assertEqual(len(inventory), 9)  # 8 documents + 1 placeholder for the empty case
         self.assertEqual(rows[("CASE1", "S1")]["action"], "download")
@@ -564,7 +541,7 @@ class DryRunTests(GetComplaintsBase):
         self.assertEqual(rows[("CASE3", "C3")]["action"], "download")
         self.assertEqual(rows[("CASE5", "C5")]["action"], "unknown-price")
         self.assertEqual(rows[("CASE6", "")]["action"], "no-documents")
-        self.assertIsNone(plaintiffs)
+        self.assertIsNone(texts)
         self.assertFalse(any(c[0] == "PUT" or c[1].startswith("caseDocument") for c in client.calls))
 
     def test_summary(self):
@@ -598,29 +575,63 @@ class DryRunTests(GetComplaintsBase):
 
 @unittest.skipUnless(HAVE_PYPDF, "pypdf not installed")
 class DownloadTests(GetComplaintsBase):
-    def test_cover_sheet_gives_plaintiffs(self):
+    def test_cover_sheet_text_is_saved_for_an_agent(self):
         docs = {"CASE1": [doc("S1", "Civil Cover Sheet", repository="UNICOURT"),
                           doc("C1", "Complaint", repository="UNICOURT")]}
         files = {"https://f/S1.pdf": make_pdf(TX_COVER_SHEET.splitlines())}
         with tempfile.TemporaryDirectory() as tmp:
             cases = write_cases(tmp, [["CASE1", "2025-1", "Brown v. Acme", "Harris", "2025-01-02"]])
-            inventory, rows, err = self._run(self._client(docs, files), self._args(tmp, cases))
-        self.assertEqual([r["plaintiff"] for r in rows], ["Angela Brown"])
-        self.assertEqual(rows[0]["case_number"], "2025-1")
+            inventory, records, err = self._run(self._client(docs, files), self._args(tmp, cases))
+        self.assertEqual(len(records), 1)
+        record = records[0]
+        self.assertEqual((record["status"], record["case_number"], record["case_name"]),
+                         ("ok", "2025-1", "Brown v. Acme"))
+        self.assertEqual((record["document_type"], record["case_document_id"]), ("civil-cover-sheet", "S1"))
+        self.assertEqual((record["page_count"], record["pages_with_text"]), (1, 1))
+        self.assertTrue(record["text"].startswith("=== Page 1 of 1 ===\n"))
+        self.assertIn("Angela Brown", record["text"])
+        self.assertTrue(record["pdf_path"].endswith("2025-1_civil-cover-sheet_S1.pdf"))
         by_id = {r["case_document_id"]: r for r in inventory}
-        self.assertEqual((by_id["S1"]["result"], by_id["S1"]["plaintiffs_found"]), ("downloaded", "1"))
+        self.assertEqual((by_id["S1"]["result"], by_id["S1"]["text_pages"]), ("downloaded", "1"))
         self.assertEqual(by_id["C1"]["result"], "")  # fallback not needed
-        self.assertIn("PDFs downloaded: 1; plaintiffs found: 1 in 1 case(s)", err)
+        self.assertIn("PDFs downloaded: 1; with text: 1 in 1 case(s)", err)
+        self.assertNotIn("Cases without text", err)
 
-    def test_falls_back_to_complaint_when_cover_sheet_has_no_names(self):
+    def test_falls_back_to_complaint_when_cover_sheet_is_a_scan(self):
         docs = {"CASE1": [doc("S1", "Civil Cover Sheet", repository="UNICOURT"),
                           doc("C1", "Complaint for Damages", repository="UNICOURT")]}
-        files = {"https://f/S1.pdf": make_pdf(["CIVIL COVER SHEET", "Check one box"]),
+        files = {"https://f/S1.pdf": make_pdf([]),  # no text layer
                  "https://f/C1.pdf": make_pdf(NY_COMPLAINT.splitlines())}
         with tempfile.TemporaryDirectory() as tmp:
             cases = write_cases(tmp, [["CASE1", "", "", "", ""]])
-            _, rows, _ = self._run(self._client(docs, files), self._args(tmp, cases))
-        self.assertEqual([r["plaintiff"] for r in rows], ["ROBERT SMITH", "LINDA SMITH"])
+            _, records, err = self._run(self._client(docs, files), self._args(tmp, cases))
+        self.assertEqual([(r["case_document_id"], r["status"]) for r in records],
+                         [("S1", "no-text-layer"), ("C1", "ok")])
+        self.assertEqual(records[0]["text"], f"=== Page 1 of 1 ===\n{pdftext.NO_TEXT}")
+        self.assertIn("ROBERT SMITH and LINDA SMITH", records[1]["text"])
+        self.assertIn("PDFs downloaded: 2; with text: 1 in 1 case(s)", err)
+        self.assertNotIn("Cases without text", err)
+
+    def test_cover_sheet_only_never_fetches_the_complaint(self):
+        docs = {"CASE1": [doc("S1", "Civil Cover Sheet", repository="UNICOURT"),
+                          doc("C1", "Complaint", repository="UNICOURT")]}
+        client = self._client(docs, {"https://f/S1.pdf": make_pdf([])})
+        with tempfile.TemporaryDirectory() as tmp:
+            cases = write_cases(tmp, [["CASE1", "", "", "", ""]])
+            inventory, records, err = self._run(client, self._args(tmp, cases, doc_types="civil-cover-sheet"))
+        self.assertEqual([(r["case_document_id"], r["status"]) for r in records], [("S1", "no-text-layer")])
+        self.assertFalse(any("C1" in c[1] for c in client.calls))
+        self.assertIn("Cases without text: no-text-layer 1", err)
+
+    def test_unreadable_pdf_is_reported_and_other_cases_continue(self):
+        docs = {"CASE1": [doc("S1", "Civil Cover Sheet", repository="UNICOURT")],
+                "CASE2": [doc("S2", "Civil Cover Sheet", repository="UNICOURT")]}
+        files = {"https://f/S1.pdf": b"not a pdf", "https://f/S2.pdf": make_pdf(TX_COVER_SHEET.splitlines())}
+        with tempfile.TemporaryDirectory() as tmp:
+            cases = write_cases(tmp, [["CASE1", "", "", "", ""], ["CASE2", "", "", "", ""]])
+            _, records, err = self._run(self._client(docs, files), self._args(tmp, cases))
+        self.assertEqual([r["status"] for r in records], ["text-extraction-failed", "ok"])
+        self.assertIn("Cases without text: text-extraction-failed 1", err)
 
     def test_paid_documents_are_never_fetched(self):
         docs = {"CASE1": [doc("S1", "Civil Cover Sheet", price=0.5), doc("C1", "Complaint", price=3)]}
@@ -672,11 +683,11 @@ class ParallelTests(GetComplaintsBase):
         with tempfile.TemporaryDirectory() as tmp:
             cases = write_cases(tmp, [[c, f"N{c}", "", "", ""] for c in docs])
             inventory, rows, err = self._run(self._client(docs, files), self._args(tmp, cases, workers=4))
-        self.assertEqual([r["case_id"] for r in rows], [c for c in docs for _ in (0, 1)])
+        self.assertEqual([r["case_id"] for r in rows], list(docs))
         self.assertTrue(all(r["status"] == "ok" for r in rows))
         self.assertEqual({r["result"] for r in inventory}, {"downloaded"})
         self.assertIn("[Listing documents: 8/8 cases", err)
-        self.assertIn("[Downloading: 8/8 cases | 0 active | 8 PDFs, 16 plaintiffs", err)
+        self.assertIn("[Downloading: 8/8 cases | 0 active | 8 PDFs, 8 with text", err)
         self.assertIn("NCASE3  saved", err)
 
     def test_court_order_status_is_reported(self):
@@ -705,11 +716,11 @@ class StatusAndStopTests(unittest.TestCase):
         status = Status(stream=out, live=False, quiet_interval=3600).start("Downloading", 3)
         status.add(active=1)
         status.log("  25-1  saved x.pdf")
-        status.add(active=-1, done=1, pdfs=1, plaintiffs=2)
+        status.add(active=-1, done=1, pdfs=1, texts=2)
         status.finish()
         text = out.getvalue()
         self.assertIn("  25-1  saved x.pdf\n", text)
-        self.assertIn("[Downloading: 1/3 cases | 0 active | 1 PDFs, 2 plaintiffs | 0m00s]", text)
+        self.assertIn("[Downloading: 1/3 cases | 0 active | 1 PDFs, 2 with text | 0m00s]", text)
         self.assertNotIn("\r", text)  # no live redraws when not a terminal
 
     def test_live_status_redraws_in_place(self):

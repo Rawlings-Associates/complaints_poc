@@ -15,7 +15,7 @@ from typing import TextIO
 
 
 class Status:
-    COUNTERS = ("done", "active", "ordering", "pdfs", "plaintiffs", "failed")
+    COUNTERS = ("done", "active", "ordering", "pdfs", "texts", "failed")
 
     def __init__(
         self,
@@ -85,8 +85,8 @@ class Status:
         parts = [f"{self.phase}: {c['done']}/{self.total} cases", f"{c['active']} active"]
         if c["ordering"]:
             parts.append(f"{c['ordering']} waiting on court orders")
-        if c["pdfs"] or c["plaintiffs"]:
-            parts.append(f"{c['pdfs']} PDFs, {c['plaintiffs']} plaintiffs")
+        if c["pdfs"] or c["texts"]:
+            parts.append(f"{c['pdfs']} PDFs, {c['texts']} with text")
         if c["failed"]:
             parts.append(f"{c['failed']} failed")
         parts.append(f"{elapsed // 60}m{elapsed % 60:02d}s")

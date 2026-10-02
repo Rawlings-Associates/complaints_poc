@@ -208,9 +208,10 @@ A separate tool that uses the UniCourt DEEP API. It finds cases that name one
 or more parties, scoped by **jurisdiction** (state, optionally county), **court
 type** (state or federal) or a **single court**, and saves them as a case list
 you can edit or pipe. For the cases on that list it inventories and prices every
-filing, downloads the **free** cover sheets or complaints (paid ones
-are priced and planned, but downloading them is not supported) and writes the
-plaintiffs named in them to CSV.
+filing, downloads the **free** cover sheets (paid ones are priced and
+planned, but downloading them is not supported) and writes the **text** of
+each one to a JSONL file. The tool does not parse names: forms differ by state
+and by court, so an agent reads the text and picks out the plaintiffs.
 
 ### Setup
 
@@ -274,11 +275,16 @@ $ unicourt search --state "New York" --court-type state \
       --party "Pfizer" --party "Pharmacia" --limit 0 --out cases.csv  # 1-2. save the cases
                                                                   # 3. edit cases.csv
 $ unicourt get-complaints -i cases.csv --dry-run                  # 4. plan and price, fetch nothing
-$ unicourt get-complaints -i cases.csv --limit 1                  # 5. free documents, one case first
-$ unicourt get-complaints -i cases.csv                            #    then the rest
+$ unicourt get-complaints -i cases.csv --limit 1                  # 5. free cover sheets, one case first
+$ unicourt get-complaints -i cases.csv                            #    then the rest -> texts.jsonl
 $ unicourt get-complaints -i cases.csv --dry-run \
       --include-paid --budget 25                                  # 6. plan paid ones within $25
 ```
+
+Only cover sheets are looked for by default. Add complaints with
+`--doc-types civil-cover-sheet,complaint` (a complaint is then fetched only if
+the cover sheet gives no text), or ask for them alone with
+`--doc-types complaint`.
 
 Or skip the file and pipe a search straight in:
 
@@ -336,11 +342,12 @@ for case search, 100 for documents.
 works, from `-i/--input-file` or from stdin.
 
 **4. `get-complaints --dry-run`** lists every document of every case and
-matches them **by name similarity**:
+matches them **by name similarity** against the `--doc-types`, in order:
 
 - A **civil cover sheet** ("Civil Case Cover Sheet", "Case Information Sheet"
-  and similar), then a **complaint** ("Complaint for Damages", "Original
-  Petition" and similar).
+  and similar): the default.
+- A **complaint** ("Complaint for Damages", "Original Petition" and
+  similar), when asked for.
 - Look-alikes such as "Answer to Complaint", "Cross-Complaint" and "Proof of
   Service" are excluded.
 
@@ -353,21 +360,22 @@ availability, the type it matched and its score, and the planned **action**:
 | Action | Meaning |
 | --- | --- |
 | `download` | Free: downloaded |
-| `fallback` | Free: downloaded only if the documents before it yield no plaintiffs |
+| `fallback` | Free: downloaded only if the documents before it give no text (failed, or a scan) |
 | `buy` | Priced, within `--budget` (dry-run plan only) |
-| `buy-fallback` | Priced: needed only if the documents before it yield no plaintiffs (plan only) |
+| `buy-fallback` | Priced: needed only if the documents before it give no text (plan only) |
 | `over-budget` | Priced: would exceed `--budget` |
 | `paid-skip` | Priced: not downloaded |
 | `unknown-price` | No price given: never fetched |
 | `sealed` | Sealed: never fetched |
 | `alternative` | A weaker match of a type already covered: not fetched |
-| *(blank)* | Not a cover sheet or complaint |
+| *(blank)* | Not one of the `--doc-types` |
 | `no-documents` | The case lists no documents |
 
 A real run fills in `result` (`downloaded`, `declined`, `failed` or
-`paid-not-supported`), `pdf_path` and `plaintiffs_found` on the same rows.
+`paid-not-supported`), `pdf_path` and `text_pages` (pages with a text layer)
+on the same rows.
 
-The summary (illustrative):
+The summary (illustrative, with `--doc-types civil-cover-sheet,complaint`):
 
 ```console
 Summary for 6 case(s), 8 document(s) listed (dry run: nothing was ordered or downloaded):
@@ -406,9 +414,9 @@ How to read it:
    downloads directly. One still at the court is ordered (`reOrder: false`),
    polled until complete, then downloaded. PDFs are saved as
    `pdfs/{caseNumber}_{type}_{documentId}.pdf`.
-5. **The plaintiffs are read** from the first document that names them: the
-   cover sheet's plaintiff label or case name, or the complaint caption. The
-   next planned document is tried only if the earlier ones yield none.
+5. **The text is saved**, not parsed: every page is extracted in layout mode,
+   so table rows (such as an attached list of plaintiffs) stay on one line.
+   The next planned document is tried only if the earlier ones give no text.
 
 **Workers and progress.** Cases run in parallel on `--workers N` threads
 (default 4, maximum 16). The threads list documents first, then download, so
@@ -416,11 +424,11 @@ one slow court order no longer holds up the others. Each event prints as it
 happens, and a status line keeps count:
 
 ```console
-  25STCV03  fetching complaint 'COMPLAINT FOR DAMAGES'
-  25STCV03  complaint order IN_PROGRESS
-  25STCV03  complaint order COMPLETE
-  25STCV03  saved pdfs/25STCV03_complaint_C1.pdf: 2 plaintiff(s)
-[Downloading: 4/6 cases | 2 active | 2 waiting on court orders | 4 PDFs, 8 plaintiffs | 0m48s]
+  25STCV03  fetching civil-cover-sheet 'Civil Case Cover Sheet'
+  25STCV03  civil-cover-sheet order IN_PROGRESS
+  25STCV03  civil-cover-sheet order COMPLETE
+  25STCV03  saved pdfs/25STCV03_civil-cover-sheet_S1.pdf: text on 4 of 4 page(s)
+[Downloading: 4/6 cases | 2 active | 2 waiting on court orders | 4 PDFs, 4 with text | 0m48s]
 ```
 
 - **In a terminal**, the status line stays at the bottom and updates every
@@ -428,9 +436,10 @@ happens, and a status line keeps count:
 - **When output goes to a file or a pipe**, it is printed as a plain line
   every 30 seconds instead.
 - **Ctrl-C** stops cleanly: queued cases are cancelled, workers waiting on a
-  court order stop waiting, and the CSVs keep everything finished so far.
-- **CSV order:** both CSVs are written in case-list order, however the
-  workers finish.
+  court order stop waiting, and the output files keep everything finished so
+  far.
+- **Output order:** `documents.csv` and `texts.jsonl` are written in
+  case-list order, however the workers finish.
 
 **Rate limit.** UniCourt allows **30 requests per 5 seconds** per account, so
 every API call goes through one shared limiter. However many workers run, no
@@ -461,15 +470,47 @@ The same error guards the download code itself. A document whose price is
 not 0, when listed or when re-checked just before fetching, is never ordered.
 In a real run it is recorded as `paid-not-supported`.
 
-`--plaintiffs-out` (default `plaintiffs.csv`) has one row per plaintiff, or one
-row per case with a `status` when none were found: `no-matching-document`,
-`no-free-document`, `declined`, `download-failed`, `paid-not-supported`,
-`no-text-layer` (a scanned PDF; OCR is not done) or
-`no-plaintiffs-found`. Both CSVs are rewritten after every case, so an
-interrupted run keeps its progress.
+### The text file, for an agent
 
-To re-parse a PDF you already have:
-`unicourt extract file.pdf --doc-type complaint`.
+`--text-out` (default `texts.jsonl`) has one JSON object per line: one per
+downloaded document, or one per case that has none. Every line carries the
+case (`case_id`, `case_number`, `case_name`, `court`, `filed_date`), the
+document (`document_type`, `document_name`, `case_document_id`, `price`,
+`pdf_path`), a `status`, `page_count`, `pages_with_text` and `text`.
+
+`status` is one of:
+
+| Status | Meaning |
+| --- | --- |
+| `ok` | Text extracted |
+| `no-text-layer` | Downloaded, but a scan: OCR is not done |
+| `text-extraction-failed` | Downloaded, but the PDF could not be read |
+| `download-failed`, `paid-not-supported` | Nothing downloaded for that reason |
+| `declined`, `not-attempted` | Not confirmed, or never reached |
+| `no-matching-document`, `no-free-document` | Nothing to download |
+
+`text` holds every page under a `=== Page N of M ===` line. Long runs of
+spaces are shortened to a three-space gap, so columns stay apart. A page
+without text reads `[no text layer on this page: scanned?]`. For example, a
+Minnesota cover sheet with an attached plaintiff list:
+
+```text
+=== Page 5 of 6 ===
+62-CV-26-5925   Filed in District Court
+State of Minnesota
+8/19/2026 12:53 PM
+STATE OF   DEPO PROVERA   DEPO PROVERA   MENINGIOMA
+PLAINTIFF FIRST  PLAINTIFF LAST   INJURED PARTY   CITIZENSHIP   START DATE   END DATE   DIAGNOSIS DATE
+Adriane   Williams   Minnesota   3/25/1997   9/30/2024   9/29/2022
+Melissa   Sunsdahl   Minnesota   1/1/1999   1/1/2004   11/7/2019
+```
+
+Read the file with any JSONL tool, e.g. one case's text:
+`jq -r 'select(.case_number == "62-CV-26-5925") | .text' texts.jsonl`.
+Both output files are rewritten after every case, so an interrupted run keeps
+its progress.
+
+To print the text of a PDF you already have: `unicourt extract file.pdf`.
 
 ### Reference material
 

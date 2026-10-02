@@ -46,7 +46,8 @@ DOC_TYPES: dict[str, dict[str, list[str]]] = {
     },
 }
 
-DEFAULT_ORDER = ("civil-cover-sheet", "complaint")
+# Only the cover sheet by default; ask for complaints with --doc-types.
+DEFAULT_ORDER = ("civil-cover-sheet",)
 DEFAULT_THRESHOLD = 0.8
 
 
@@ -152,7 +153,7 @@ def rank(
 def attempts(
     matches: dict[str, list[Candidate]], order: Iterable[str], include_paid: bool = False
 ) -> list[Candidate]:
-    """The documents to try for one case, in order, until one yields plaintiffs.
+    """The documents to try for one case, in order, until one gives readable text.
 
     Free documents come first (the best free match of each type, in type
     order). With ``include_paid``, the best priced match of each type that has
